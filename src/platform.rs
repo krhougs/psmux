@@ -855,8 +855,7 @@ pub mod mouse_inject {
         }
         if !ENABLED.load(Ordering::Relaxed) { return; }
 
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-        let path = format!("{}/.psmux/mouse_debug.log", home);
+        let path = format!("{}/mouse_debug.log", crate::paths::psmux_dir());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             use std::io::Write;
             let _ = writeln!(f, "[platform] {}", msg);
@@ -2882,8 +2881,7 @@ pub mod process_info {
         static COUNT: AtomicU32 = AtomicU32::new(0);
         let n = COUNT.fetch_add(1, Ordering::Relaxed);
         if n > 100 { return; }
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-        let path = format!("{}/.psmux/autorename.log", home);
+        let path = format!("{}/autorename.log", crate::paths::psmux_dir());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             use std::io::Write;
             let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
