@@ -112,6 +112,25 @@ pub fn port_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.port", psmux_dir(), session.as_ref())
 }
 
+/// Directory holding one ownership marker per server process this data dir
+/// started (issue #510).
+///
+/// The startup reaper enumerates candidate servers machine-wide, but its
+/// registry only describes one data dir. Without a per-process record of
+/// "this one is mine" it cannot tell an orphan of its own from another
+/// instance's healthy server, and killing on that ambiguity destroyed live
+/// sessions belonging to a different USERPROFILE/HOME. A server writes its
+/// marker into its OWN data dir, so ownership is self-declared and needs no
+/// inspection of other processes.
+pub fn server_marker_dir() -> String {
+    format!("{}\\servers", psmux_dir())
+}
+
+/// Path to one server process's ownership marker (see `server_marker_dir`).
+pub fn server_marker_file(pid: u32) -> String {
+    format!("{}\\{}", server_marker_dir(), pid)
+}
+
 /// Fallible variant of [`port_file`]: `None` when no data directory can be
 /// determined. Lets a call site early-exit on the same condition without having
 /// to know that `port_file` routes through `psmux_dir`.
@@ -137,6 +156,44 @@ pub fn pid_file(session: impl AsRef<str>) -> String {
 /// Path to a session's `.spawnlock` file (the warm-pool spawn lock).
 pub fn spawnlock_file(session: impl AsRef<str>) -> String {
     format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
+}
+
+/// Directory holding one namespace-identity file per `-L` namespace (issue #509).
+///
+/// A subdirectory rather than a `<ns>.instance` sibling: session files are named
+/// `<ns>__<session>.<ext>`, and the default namespace uses a bare `<session>`,
+/// so any flat naming risks colliding with a legitimately-named session.
+pub fn instance_dir_in(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("instances")
+}
+
+/// Path to a namespace's identity file. `ns` is the `-L` value, or `None` for
+/// the default namespace.
+///
+/// The file name is a readable prefix plus a hash of the *full* namespace name.
+/// `-L` values come from the user and may contain characters that are illegal in
+/// a filename (or that would collide once sanitised — `a/b` and `a_b` both
+/// become `a_b`), so the hash, not the prefix, is what guarantees isolation.
+pub fn namespace_instance_file(dir: &std::path::Path, ns: Option<&str>) -> std::path::PathBuf {
+    let name = match ns {
+        None => "default-0000000000000000".to_string(),
+        Some(n) => {
+            use std::hash::{Hash, Hasher};
+            // A fixed-seed hasher: the file name must be identical across
+            // processes and runs, so `RandomState` (used for the random session
+            // key) is deliberately NOT used here.
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            n.hash(&mut h);
+            let digest = h.finish();
+            let prefix: String = n
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(32)
+                .collect();
+            format!("{}-{:016x}", prefix, digest)
+        }
+    };
+    instance_dir_in(dir).join(name)
 }
 
 #[cfg(test)]

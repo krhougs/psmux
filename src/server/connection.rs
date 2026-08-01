@@ -10,6 +10,28 @@ use crate::util::base64_decode;
 use crate::control;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Append-only AUTH diagnostics, gated by PSMUX_AUTH_DEBUG=1. Written to
+/// %TEMP%\psmux_auth_debug.log so concurrent processes never truncate each
+/// other (issue #496 forensics).
+fn auth_debug(msg: &str) {
+    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        let tmp = std::env::var("TEMP")
+            .or_else(|_| std::env::var("TMP"))
+            .unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}\\psmux_auth_debug.log", tmp);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = std::io::Write::write_all(
+                &mut f,
+                format!("[{} pid={}] {}\n", ts, std::process::id(), msg).as_bytes(),
+            );
+        }
+    }
+}
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
@@ -273,12 +295,14 @@ let mut r = io::BufReader::new(stream);
 // Read the authentication line
 let mut auth_line = String::new();
 if r.read_line(&mut auth_line).is_err() {
+    auth_debug(&format!("client_id={} reject: auth read_line error/timeout", client_id));
     return;
 }
 
 // Verify session key
 let auth_line = auth_line.trim();
 if !auth_line.starts_with("AUTH ") {
+    auth_debug(&format!("client_id={} reject: no AUTH prefix, line={:?}", client_id, auth_line));
     // Legacy client without auth - reject for security
     let _ = write_stream.write_all(b"ERROR: Authentication required\n");
     let _ = write_stream.flush();
@@ -286,6 +310,10 @@ if !auth_line.starts_with("AUTH ") {
 }
 let provided_key = auth_line.strip_prefix("AUTH ").unwrap_or("");
 if provided_key != session_key {
+    auth_debug(&format!(
+        "client_id={} reject: key mismatch provided={:?} expected={:?}",
+        client_id, provided_key, session_key
+    ));
     let _ = write_stream.write_all(b"ERROR: Invalid session key\n");
     let _ = write_stream.flush();
     return;
@@ -887,9 +915,13 @@ let args: Vec<&str> = {
 };
 // Commands that should permanently change focus when used with -t
 let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp");
-// Commands that handle -t internally and should NOT get FocusWindowTemp
+// Commands that handle -t internally and should NOT get FocusWindowTemp.
+// switch-client resolves the window/pane target itself (#483) and makes the
+// change PERMANENT; letting the generic block issue a temporary focus here
+// would restore the old focus after the batch and silently undo the switch.
 let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep"
-    | "move-window" | "movew" | "swap-window" | "swapw");
+    | "move-window" | "movew" | "swap-window" | "swapw"
+    | "switch-client" | "switchc");
 if let Some(wid) = target_win {
     if is_focus_cmd {
         if target_win_is_id {
@@ -945,19 +977,26 @@ match cmd {
         let format_str: Option<String> = extract_flag_value(&args, "-F").map(|s| s.trim_matches('"').to_string());
         let title: Option<String> = extract_flag_value(&args, "-T").map(|s| s.trim_matches('"').to_string());
         let empty = args.iter().any(|a| *a == "-E");
+        // -e KEY=VALUE (repeatable, tmux parity, #489): collect environment
+        // for the new pane. The values must also be excluded from the
+        // shell-command extraction below or they get spawned as the command.
+        let env_sets: Vec<(String, String)> = args.windows(2)
+            .filter(|w| w[0] == "-e")
+            .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
         let cmd_str: Option<String> = args.iter()
-            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && !args.iter().any(|f| f.starts_with("-F") && f.len() > 2 && &f[2..] == **a))
+            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-n" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)) && !args.iter().any(|f| f.starts_with("-F") && f.len() > 2 && &f[2..] == **a))
             .map(|s| s.trim_matches('"').to_string());
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty));
+            let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
             if let Ok(text) = rrx.recv_timeout(Duration::from_millis(2000)) {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
             if !persistent { break; }
         } else {
-            let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty));
+            let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
         }
     }
     "split-window" | "splitw" | "split-pane" | "splitp" => {
@@ -977,12 +1016,20 @@ match cmd {
                     let is_pct = raw.ends_with('%');
                     raw.trim_end_matches('%').parse::<u16>().ok().map(|v| (v, is_pct))
                 }));
+        // -e KEY=VALUE (repeatable, tmux parity, #489): environment for the
+        // new pane. Excluded from shell-command extraction below — before
+        // this fix the -e value itself was spawned as the pane command,
+        // which flashed a red error and closed the pane instantly.
+        let env_sets: Vec<(String, String)> = args.windows(2)
+            .filter(|w| w[0] == "-e")
+            .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
         let cmd_str: Option<String> = args.iter()
-            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)))
+            .find(|a| !a.starts_with('-') && args.windows(2).all(|w| !(w[0] == "-c" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-p" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-l" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-T" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-F" && w[1] == **a)) && args.windows(2).all(|w| !(w[0] == "-e" && w[1] == **a)))
             .map(|s| s.trim_matches('"').to_string());
         if print_info {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title));
+            let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets));
             if let Ok(text) = rrx.recv_timeout(Duration::from_millis(2000)) {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
@@ -990,7 +1037,7 @@ match cmd {
             if !persistent { break; }
         } else {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title));
+            let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title, env_sets));
             if let Ok(err_msg) = rrx.recv_timeout(Duration::from_millis(2000)) {
                 if !err_msg.is_empty() {
                     let _ = write!(write_stream, "{}\n", err_msg);
@@ -1342,11 +1389,10 @@ match cmd {
             for _ in 0..repeat_count {
                 if paste_mode {
                     let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
-                } else if effective_literal {
-                    // Literal: concatenate without space separator.
-                    let _ = tx.send(CtrlReq::SendKeys(keys.join(""), true));
                 } else {
-                    let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), false));
+                    // #490: hand the tokens over UNJOINED so quoted
+                    // arguments keep their exact whitespace end to end.
+                    let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
                 }
             }
         }
@@ -1385,8 +1431,11 @@ match cmd {
         }
     }
     "select-window" | "selectw" => {
+        // An @id target was already focused permanently by the generic target
+        // focus block above (FocusWindowById). Re-sending it here as an INDEX
+        // via SelectWindow would override that with the wrong window (#497).
         let idx = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok())
-            .or(target_win);
+            .or(if target_win_is_id { None } else { target_win });
         if let Some(idx) = idx {
             let _ = tx.send(CtrlReq::SelectWindow(idx));
         }
@@ -1936,7 +1985,11 @@ match cmd {
     "session-info" => {
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::SessionInfo(rtx));
-        if let Ok(line) = rrx.recv() {
+        // Bounded wait: session-info doubles as the Tier 2 execution barrier for
+        // send_control, so it must never block the connection thread forever if
+        // the event loop is momentarily wedged — that would leak the thread and
+        // hold the socket open. 3s is far longer than a healthy loop cycle.
+        if let Ok(line) = rrx.recv_timeout(Duration::from_secs(3)) {
             if persistent {
                 let _ = tx.send(CtrlReq::ShowTextPopup("session-info".to_string(), line));
             } else {
@@ -2313,7 +2366,17 @@ match cmd {
         let stdin_flag = args.iter().any(|a| *a == "-I");
         let stdout_flag = args.iter().any(|a| *a == "-O");
         let toggle = args.iter().any(|a| *a == "-o");
-        let cmd = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+        // #482: everything after pipe-pane's own options (-I/-O/-o; the -t target
+        // was already stripped by the global -t parser) is an opaque shell
+        // command. Skip only the leading option flags and keep the rest verbatim
+        // so the command's OWN dash-flags survive (e.g.
+        // `pwsh -NoProfile -EncodedCommand <b64>`). Previously every dash-token
+        // was filtered out, silently mangling the piped command.
+        let mut start = 0;
+        while start < args.len() && matches!(args[start], "-I" | "-O" | "-o") {
+            start += 1;
+        }
+        let cmd = args[start..].join(" ");
         let (stdin, stdout) = if !stdin_flag && !stdout_flag {
             (false, true)
         } else {
@@ -2357,17 +2420,22 @@ match cmd {
         } else if args.contains(&"-l") {
             let _ = tx.send(CtrlReq::SwitchClient(String::new(), 'l'));
         } else {
-            // -t <target> was already extracted into raw_target by the global -t parser.
-            // Use raw_target which holds the original -t value (session name, not window id).
+            // -t <target> was already extracted into raw_target by the global -t
+            // parser. Pass the FULL target (session:window.pane / @window / %pane)
+            // to the server loop so it switches the session AND selects the
+            // addressed window/pane, and validates existence (#483). Previously
+            // the window/pane suffix was stripped and silently ignored.
             let target = raw_target.clone().unwrap_or_default();
-            // Strip any window/pane suffix (e.g. "session:window.pane" -> "session")
-            let session_target = if let Some(pos) = target.find(':') {
-                target[..pos].to_string()
-            } else {
-                target
-            };
-            let _ = tx.send(CtrlReq::SwitchClient(session_target, 't'));
+            let (rtx, rrx) = mpsc::channel::<String>();
+            let _ = tx.send(CtrlReq::SwitchClientTarget(target, rtx));
+            let resp = rrx.recv_timeout(Duration::from_millis(2000))
+                .unwrap_or_else(|_| "OK".to_string());
+            if !persistent {
+                let _ = write!(write_stream, "{}\n", resp);
+                let _ = write_stream.flush();
+            }
         }
+        if !persistent { break; }
     }
     "lock-client" | "lockc" => {
         let _ = tx.send(CtrlReq::LockClient);
@@ -2734,6 +2802,27 @@ match cmd {
         } else {
             trimmed.to_string()
         };
+        // Expand #{...} against live server state (tmux parity). This thread has
+        // no &AppState — it belongs to the server loop — so the expansion makes
+        // a round trip over the control channel. Only pay for it when the
+        // command actually contains a format reference.
+        //
+        // Without this, `run-shell "helper '#{pane_id}'"` passed the helper the
+        // literal text `#{pane_id}`; with `-b` swallowing the spawn result, the
+        // bind then failed completely silently.
+        let shell_cmd = if shell_cmd.contains("#{") {
+            let (rtx, rrx) = mpsc::channel::<String>();
+            if tx.send(CtrlReq::ExpandFormat(shell_cmd.clone(), rtx)).is_ok() {
+                // On timeout fall back to the unexpanded string: running the
+                // command with a literal #{...} is no worse than the old
+                // behaviour, and better than dropping it silently.
+                rrx.recv_timeout(Duration::from_secs(5)).unwrap_or(shell_cmd)
+            } else {
+                shell_cmd
+            }
+        } else {
+            shell_cmd
+        };
         // Expand ~ to home directory + XDG fallback for plugin paths
         let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd);
         if shell_cmd.is_empty() {
@@ -2744,7 +2833,22 @@ match cmd {
         } else {
             if background {
                 let mut c = crate::commands::build_run_shell_command(&shell_cmd);
-                let _ = c.spawn();
+                // `-b` means "don't wait for it", not "don't tell me it never
+                // started". Swallowing this made a broken background bind
+                // indistinguishable from an unbound key.
+                if let Err(e) = c.spawn() {
+                    // No trailing newline in the message itself: StatusMessage is
+                    // stored verbatim in app.status_message and rendered in the
+                    // status bar, where a stray newline corrupts the line. The
+                    // newline belongs only on the stream write.
+                    let err_msg = format!("run-shell: {}: {}", shell_cmd, e);
+                    if persistent {
+                        let _ = tx.send(CtrlReq::StatusMessage(err_msg));
+                    } else {
+                        let _ = write!(write_stream, "{}\n", err_msg);
+                        let _ = write_stream.flush();
+                    }
+                }
             } else {
                 let mut c = crate::commands::build_run_shell_command(&shell_cmd);
                 let result = c.output();
@@ -2768,11 +2872,13 @@ match cmd {
                         }
                     }
                     Err(e) => {
-                        let err_msg = format!("run-shell: {}\n", e);
+                        // Same newline handling as the -b path above (this one
+                        // predates the branch; fixed alongside for consistency).
+                        let err_msg = format!("run-shell: {}", e);
                         if persistent {
                             let _ = tx.send(CtrlReq::StatusMessage(err_msg));
                         } else {
-                            let _ = write!(write_stream, "{}", err_msg);
+                            let _ = write!(write_stream, "{}\n", err_msg);
                             let _ = write_stream.flush();
                         }
                     }
@@ -3267,15 +3373,20 @@ fn dispatch_control_command(
             let cmd_str: Option<String> = args.iter().enumerate()
                 .find(|(i, _)| !skip.contains(i))
                 .map(|(_, s)| s.trim_matches('"').to_string());
+            // -e KEY=VALUE environment for the new pane (tmux parity, #489).
+            let env_sets: Vec<(String, String)> = args.windows(2)
+                .filter(|w| w[0] == "-e")
+                .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect();
             if print_info {
                 let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty));
+                let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
                 if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                     let _ = resp_tx.send(text);
                 }
                 true
             } else {
-                let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty));
+                let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
                 let _ = resp_tx.send(String::new());
                 true
             }
@@ -3302,11 +3413,16 @@ fn dispatch_control_command(
                         let is_pct = raw.ends_with('%');
                         raw.trim_end_matches('%').parse::<u16>().ok().map(|v| (v, is_pct))
                     }));
+            // -e KEY=VALUE environment for the new pane (tmux parity, #489).
+            let env_sets: Vec<(String, String)> = args.windows(2)
+                .filter(|w| w[0] == "-e")
+                .filter_map(|w| w[1].trim_matches('"').split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect();
             let (rtx, rrx) = mpsc::channel::<String>();
             if print_info {
-                let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title));
+                let _ = tx.send(CtrlReq::SplitWindowPrint(kind, cmd_str, detached, start_dir, split_size, format_str, rtx, title, env_sets));
             } else {
-                let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title));
+                let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title, env_sets));
             }
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);
@@ -3354,8 +3470,9 @@ fn dispatch_control_command(
                 false
             });
             let effective_literal = literal || any_hex;
-            let text = if effective_literal { keys.join("") } else { keys.join(" ") };
-            let _ = tx.send(CtrlReq::SendKeys(text, effective_literal));
+            // #490: hand the tokens over UNJOINED so quoted arguments keep
+            // their exact whitespace end to end.
+            let _ = tx.send(CtrlReq::SendKeys(keys, effective_literal));
             let _ = resp_tx.send(String::new());
             true
         }

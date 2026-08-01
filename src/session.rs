@@ -177,6 +177,46 @@ pub fn remove_session_pid_file(port_file_base: &str) {
     let _ = std::fs::remove_file(&pid_path);
 }
 
+/// Record that server process `pid` belongs to THIS data dir (issue #510).
+///
+/// Keyed by PID rather than by session, and deliberately independent of the
+/// session registry lifecycle: the whole point is to still identify a server as
+/// ours after its `.port`/`.pid` entries are gone, which is exactly the state a
+/// spawn-race duplicate or a registry wipe leaves behind. Body is the same
+/// `pid:creation_filetime` as the `.pid` sentinel so a reused PID cannot
+/// inherit a dead process's claim.
+pub fn write_server_marker(pid: u32) {
+    let dir = crate::paths::server_marker_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let creation = crate::platform::process_kill::process_creation_time(pid).unwrap_or(0);
+    let _ = std::fs::write(
+        crate::paths::server_marker_file(pid),
+        format_pid_file_contents(pid, creation),
+    );
+}
+
+/// Server processes `psmux_dir` claims, as `pid -> recorded creation filetime`.
+///
+/// The PID is read from the file body rather than its name so a truncated or
+/// hand-copied marker cannot assert a claim over an arbitrary PID.
+pub fn read_owned_server_pids(psmux_dir: &Path) -> std::collections::HashMap<u32, Option<u64>> {
+    let mut owned = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(psmux_dir.join("servers")) else {
+        return owned;
+    };
+    for entry in entries.flatten() {
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some((pid, creation)) = parse_pid_file_contents(&body) {
+            owned.insert(pid, creation);
+        }
+    }
+    owned
+}
+
 /// Resolve a tmux session ID (`$N`) to the port file base name of the
 /// session that owns that ID. Returns `None` if no session has that ID.
 pub fn resolve_session_by_id(id: usize) -> Option<String> {
@@ -258,6 +298,7 @@ fn select_orphan_pids(
     candidates: &[ServerCandidate],
     tracked_ports: &std::collections::HashSet<u16>,
     tracked_pids: &std::collections::HashSet<u32>,
+    owned_pids: &std::collections::HashMap<u32, Option<u64>>,
     self_pid: u32,
     age_cutoff_ft: u64,
 ) -> Vec<u32> {
@@ -266,6 +307,22 @@ fn select_orphan_pids(
         if c.pid == self_pid { continue; }
         if tracked_pids.contains(&c.pid) { continue; }
         if c.ports.iter().any(|p| tracked_ports.contains(p)) { continue; }
+        // Issue #510: reap only what this data dir can positively claim.
+        //
+        // The candidate list is machine-wide, so "no registry entry references
+        // it" covers two very different processes: an orphan we started, and a
+        // perfectly healthy server belonging to another USERPROFILE/HOME. The
+        // old rule could not tell them apart and killed both. An absent
+        // ownership marker now means "not ours, not our business" rather than
+        // "orphan" - unknown must never justify termination.
+        let Some(&recorded_creation) = owned_pids.get(&c.pid) else { continue; };
+        // Same identity gate force_kill_targets applies: without a recorded
+        // creation time there is nothing to distinguish this process from an
+        // unrelated one that inherited the PID, so it is not a candidate.
+        match recorded_creation {
+            Some(ft) if ft == c.creation_ft => {}
+            _ => continue,
+        }
         // Only reap processes old enough to have finished registering.
         if age_cutoff_ft != 0 && c.creation_ft > age_cutoff_ft { continue; }
         out.push(c.pid);
@@ -384,6 +441,201 @@ pub fn confirms_identity(queried: Option<u64>, expected: u64) -> bool {
     queried == Some(expected)
 }
 
+/// `.pid` registry entries belonging to namespace `ns`, excluding `self_pid`
+/// (issue #509).
+///
+/// Membership is decided by the file-name convention: a `-L` namespace writes
+/// `<ns>__<session>.pid`, while the default namespace writes a bare
+/// `<session>.pid`. The warm helper is included in both cases — it is a real
+/// server, so while it lives the namespace has not gone away.
+pub fn namespace_peer_pids(dir: &Path, ns: Option<&str>, self_pid: u32) -> Vec<PidTarget> {
+    let mut peers = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return peers; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e != "pid").unwrap_or(true) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let mine = match ns {
+            Some(n) => stem.starts_with(&format!("{}__", n)),
+            // A bare session name has no `__` separator; the default namespace's
+            // own warm helper is the one exception.
+            None => !stem.contains("__") || stem == "__warm__",
+        };
+        if !mine {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some((pid, Some(creation_time))) = parse_pid_file_contents(&contents) {
+                if pid != self_pid {
+                    peers.push(PidTarget { pid, creation_time });
+                }
+            }
+        }
+    }
+    peers
+}
+
+/// Whether the calling server is the first live server in its namespace, i.e.
+/// no peer from the registry is still running under its recorded identity.
+///
+/// `creation_of` supplies each pid's current creation FILETIME (`None` when the
+/// process is gone or unreadable) so the decision is testable without OS process
+/// enumeration. A pid whose creation time no longer matches has been recycled
+/// and is somebody else's process, not our peer.
+pub fn is_first_server_in_namespace(
+    peers: &[PidTarget],
+    creation_of: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    !peers
+        .iter()
+        .any(|p| confirms_identity(creation_of(p.pid), p.creation_time))
+}
+
+/// Mint a fresh namespace identity token.
+fn mint_instance_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let s = RandomState::new();
+    let mut h = s.build_hasher();
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    );
+    h.write_u64(std::process::id() as u64);
+    format!("{:016x}", h.finish())
+}
+
+/// Establish this namespace's stable identity (issue #509), returning the token
+/// now in force.
+///
+/// psmux runs one server process per session, so a per-process value such as
+/// `#{pid}` changes every time a session is created and a supervisor reads that
+/// as a server restart. Every server in a namespace instead reads one shared
+/// token file, so it does not matter which server answers a query.
+///
+/// The token is minted by the namespace's first server and left alone by every
+/// later one. It is re-minted only when no peer is still alive — that is a
+/// genuine restart, and a supervisor must be able to see it. Reclamation is
+/// therefore self-healing: a token left behind by a namespace that died is
+/// replaced by the next server to start, so nothing needs to delete it on exit
+/// (a server can exit via exit-empty, kill-session, or a crash).
+///
+/// `established` is the token this server already holds from a previous call,
+/// or `None` on the first call of the process. The first-server decision — and
+/// the re-mint it triggers — belongs to server STARTUP only: this function is
+/// also re-run every few seconds by the registry self-heal loop, and a lone
+/// server (single session, no warm helper) sees no live peers on every tick.
+/// Re-deciding there would delete and re-mint its own token every interval,
+/// churning the very identity this feature exists to keep stable. Once a token
+/// is established, re-ensure only restores the file if it was lost — with the
+/// SAME token, so even losing the file does not fake a restart.
+pub fn ensure_namespace_instance_in(
+    dir: &Path,
+    ns: Option<&str>,
+    self_pid: u32,
+    creation_of: impl Fn(u32) -> Option<u64>,
+    established: Option<&str>,
+) -> Option<String> {
+    let path = crate::paths::namespace_instance_file(dir, ns);
+
+    match established {
+        // Steady state: this server already holds the namespace's identity.
+        // While it is alive the namespace cannot have restarted, so never
+        // delete or re-mint — only put the established token back if the file
+        // went missing.
+        Some(token) => {
+            if !write_token_if_missing(&path, token) {
+                return None;
+            }
+        }
+        // Startup: decide whether this is a fresh namespace or a join.
+        None => {
+            let peers = namespace_peer_pids(dir, ns, self_pid);
+            if is_first_server_in_namespace(&peers, creation_of) {
+                // The namespace this token described is gone; do not inherit its identity.
+                let _ = std::fs::remove_file(&path);
+            }
+            if !write_token_if_missing(&path, &mint_instance_token()) {
+                return None;
+            }
+        }
+    }
+
+    read_namespace_instance_in(dir, ns)
+}
+
+/// Create the token file with `token` unless it already exists (`create_new`,
+/// so a concurrent first-start cannot clobber the winner's token). Returns
+/// false only on an unexpected I/O failure.
+fn write_token_if_missing(path: &Path, token: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = write!(f, "{}", token);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(_) => false,
+    }
+}
+
+/// Read a namespace's identity token, or `None` when the namespace has none.
+///
+/// Reading never mints: only a starting server may establish identity, so a
+/// client query against an unknown namespace reports nothing rather than
+/// inventing a value.
+pub fn read_namespace_instance_in(dir: &Path, ns: Option<&str>) -> Option<String> {
+    let path = crate::paths::namespace_instance_file(dir, ns);
+    let contents = std::fs::read_to_string(path).ok()?;
+    let token = contents.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// The namespace identity this server process established at startup. One
+/// server process serves exactly one namespace, so a process-wide cell is the
+/// correct scope; it is what makes the periodic registry re-ensure a restore
+/// rather than a fresh first-server decision (see
+/// [`ensure_namespace_instance_in`]).
+static ESTABLISHED_INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Production wrapper for [`ensure_namespace_instance_in`] against the real data
+/// directory and live process table.
+pub fn ensure_namespace_instance(ns: Option<&str>, self_pid: u32) -> Option<String> {
+    let dir = crate::paths::psmux_dir_opt()?;
+    let token = ensure_namespace_instance_in(
+        Path::new(&dir),
+        ns,
+        self_pid,
+        |pid| crate::platform::process_kill::process_creation_time(pid),
+        ESTABLISHED_INSTANCE.get().map(|s| s.as_str()),
+    )?;
+    let _ = ESTABLISHED_INSTANCE.set(token.clone());
+    Some(token)
+}
+
+/// Production wrapper for [`read_namespace_instance_in`].
+pub fn read_namespace_instance(ns: Option<&str>) -> Option<String> {
+    let dir = crate::paths::psmux_dir_opt()?;
+    read_namespace_instance_in(Path::new(&dir), ns)
+}
+
 /// Terminate live psmux *server* processes that no registry entry accounts for
 /// (issue #448). Complements `cleanup_stale_port_files`, which only removes
 /// registry files for servers already proven dead: this pass finds a live but
@@ -439,13 +691,52 @@ fn reap_orphaned_servers_in(psmux_dir: &Path) {
         candidates.push(ServerCandidate { pid, ports, creation_ft });
     }
 
-    let orphans = select_orphan_pids(&candidates, &tracked_ports, &tracked_pids, self_pid, age_cutoff_ft);
+    let owned_pids = read_owned_server_pids(psmux_dir);
+    let orphans = select_orphan_pids(
+        &candidates, &tracked_ports, &tracked_pids, &owned_pids, self_pid, age_cutoff_ft);
     for pid in orphans {
         if crate::debug_log::session_log_enabled() {
             crate::debug_log::session_log("reaper", &format!(
-                "terminating orphaned psmux server pid {} (no registry entry references it)", pid));
+                "terminating orphaned psmux server pid {} (this data dir claims it, no registry entry references it)", pid));
         }
         process_kill::terminate_server_pid(pid, Some(now_ft));
+    }
+
+    prune_stale_server_markers(psmux_dir, &owned_pids);
+}
+
+/// Delete ownership markers whose process is gone or whose PID now belongs to
+/// something else, so the directory tracks live servers rather than growing
+/// without bound. Kept separate from reaping: a marker is only a claim, and
+/// dropping a claim never terminates anything.
+///
+/// This is the sole reclamation path rather than a removal on server shutdown:
+/// a server can exit down several routes (exit-empty, kill-session, a crash)
+/// and a marker missed by any of them would linger forever, so the invariant is
+/// "markers are reconciled against the process table", not "every exit tidies
+/// up after itself". A lingering marker is harmless in the meantime — it names
+/// either a dead PID or, after reuse, a process whose creation time no longer
+/// matches, and neither can authorise a kill.
+fn prune_stale_server_markers(
+    psmux_dir: &Path,
+    owned_pids: &std::collections::HashMap<u32, Option<u64>>,
+) {
+    for (&pid, &recorded_creation) in owned_pids {
+        let live_creation = crate::platform::process_kill::process_creation_time(pid);
+        let still_ours = match (live_creation, recorded_creation) {
+            // Process is gone.
+            (None, _) => false,
+            // Same PID, different process: the original exited and the PID was
+            // reused, so this claim is stale.
+            (Some(live), Some(recorded)) => live == recorded,
+            // No recorded creation time to compare against. Keep it: a marker
+            // that cannot be identity-checked can never authorise a kill
+            // either, so leaving it costs nothing.
+            (Some(_), None) => true,
+        };
+        if !still_ours {
+            let _ = std::fs::remove_file(psmux_dir.join("servers").join(pid.to_string()));
+        }
     }
 }
 
@@ -1212,6 +1503,14 @@ pub fn send_control(line: String) -> io::Result<()> {
         let _ = write!(stream, "TARGET {}\n", ft);
     }
     let _ = write!(stream, "{}", line);
+    // Tier 2 — confirmed EXECUTION (not just delivery): append a `session-info`
+    // barrier. It round-trips through the server's single FIFO event loop, so its
+    // reply proves the command above was actually applied, not merely enqueued.
+    // This makes send_control synchronous and closes races where a caller inspects
+    // the effect immediately after the CLI returns. For commands whose server
+    // handler tears down the connection first (e.g. kill-session), the barrier is
+    // simply never answered — that path is covered by the caller's verify-retry.
+    let _ = write!(stream, "session-info\n");
     let _ = stream.flush();
     // Half-close the write side so the server observes EOF *after* our bytes.
     // TCP guarantees all sent data is delivered before the FIN, so the server's
@@ -1219,8 +1518,9 @@ pub fn send_control(line: String) -> io::Result<()> {
     // the RST-on-close race that used to silently drop fire-and-forget commands
     // (the old 50ms "drain" read was only a partial mitigation).
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    // Drain to EOF (bounded by the read timeout): confirms the server stayed up
-    // and consumed the command before we drop the socket.
+    // Read to EOF (bounded by the read timeout): blocks until the server has
+    // processed the barrier — i.e. the command has executed — or the connection
+    // closes / times out.
     let mut buf = [0u8; 256];
     loop {
         match std::io::Read::read(&mut stream, &mut buf) {
@@ -1605,3 +1905,11 @@ mod tests_startup_stale_port_tax;
 #[cfg(test)]
 #[path = "../tests-rs/test_l_socket_tmux_precedence.rs"]
 mod tests_l_socket_tmux_precedence;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue509_namespace_instance.rs"]
+mod tests_issue509_namespace_instance;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue510_reaper_attribution.rs"]
+mod tests_issue510_reaper_attribution;

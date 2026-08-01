@@ -105,7 +105,17 @@ pub struct Screen {
     alternate_grid: crate::grid::Grid,
 
     attrs: crate::attrs::Attrs,
+    /// DECSC slot for the MAIN screen. Also the slot DECSET 1049 saves into on
+    /// the way into the alternate screen, and restores from on the way out.
     saved_attrs: crate::attrs::Attrs,
+    /// DECSC slot for the ALTERNATE screen (issue #502). Each screen owns its
+    /// own saved cell, matching tmux (DECSC/DECRC use `ictx->old_cell` in
+    /// input.c, entirely separate from the alternate screen's
+    /// `s->saved_cell`). Sharing one slot let a full screen app that saved the
+    /// cursor while its colorscheme was active poison the main screen: on exit
+    /// DECSET 1049 restored the app's colors instead of the shell's, and every
+    /// line printed afterwards inherited them.
+    alternate_saved_attrs: crate::attrs::Attrs,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -197,6 +207,7 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            alternate_saved_attrs: crate::attrs::Attrs::default(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -261,6 +272,21 @@ impl Screen {
     /// vim use the alternate screen and do not retain history).
     pub fn set_scrollback_len(&mut self, new_len: usize) {
         self.grid_mut().set_scrollback_len(new_len);
+    }
+
+    /// Copy-mode freeze (psmux issue #494): while set, the main grid's
+    /// visible region stays anchored to its current content — new rows
+    /// entering scrollback bump the scrollback offset instead of shifting
+    /// the view, matching tmux's frozen copy-mode screen.  Always targets
+    /// the main grid (the alternate grid has no scrollback to anchor to).
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.grid.set_frozen(frozen);
+    }
+
+    /// Whether the copy-mode freeze anchor is currently set on the main grid.
+    #[must_use]
+    pub fn frozen(&self) -> bool {
+        self.grid.frozen()
     }
 
     /// Returns the configured maximum size of the scrollback buffer.
@@ -1007,6 +1033,9 @@ impl Screen {
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
         self.alternate_grid.allocate_rows();
+        // Start the alternate screen's DECSC slot clean so a value left by a
+        // previous alternate-screen session cannot surface in this one.
+        self.alternate_saved_attrs = crate::attrs::Attrs::default();
     }
 
     fn exit_alternate_grid(&mut self) {
@@ -1052,12 +1081,23 @@ impl Screen {
 
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
-        self.saved_attrs = self.attrs;
+        // The cursor POSITION already lives in the per-grid slot that
+        // `grid_mut()` selects; route the attributes to the matching slot so
+        // the two screens cannot overwrite each other (issue #502).
+        if self.mode(MODE_ALTERNATE_SCREEN) {
+            self.alternate_saved_attrs = self.attrs;
+        } else {
+            self.saved_attrs = self.attrs;
+        }
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = self.saved_attrs;
+        self.attrs = if self.mode(MODE_ALTERNATE_SCREEN) {
+            self.alternate_saved_attrs
+        } else {
+            self.saved_attrs
+        };
     }
 
     fn set_mode(&mut self, mode: u8) {

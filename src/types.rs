@@ -439,6 +439,9 @@ pub struct CopyModeState {
     pub text_object_pending: Option<u8>,
     pub register_pending: bool,
     pub register: Option<char>,
+    /// Mark and last-jump are pane-local like the rest of copy state (#498)
+    pub mark: Option<(usize, u16, u16)>,
+    pub last_jump: Option<(u8, char)>,
     /// true when the pane was in CopySearch (not CopyMode)
     pub in_search: bool,
     /// search input buffer (only meaningful when in_search == true)
@@ -560,6 +563,16 @@ pub struct AppState {
     pub copy_register_pending: bool,
     /// Currently selected named register (a-z), None = default unnamed
     pub copy_register: Option<char>,
+    /// Copy-mode mark set by `X` (set-mark): (scroll_offset, row, col).
+    /// `M-x` (jump-to-mark) swaps the cursor with it, so pressing it twice
+    /// returns you to where you started, same as tmux (#498).
+    pub copy_mark: Option<(usize, u16, u16)>,
+    /// Last f/F/t/T jump as (kind, char), so `;` (jump-again) and `,`
+    /// (jump-reverse) can repeat it (#498).
+    pub copy_last_jump: Option<(u8, char)>,
+    /// When true the pane keeps following live output while in copy mode
+    /// instead of being anchored. Toggled by `r` (refresh-from-pane) (#498).
+    pub copy_refresh_live: bool,
     /// Named registers a-z for copy-mode yank/paste
     pub named_registers: std::collections::HashMap<char, String>,
     pub display_map: Vec<(usize, Vec<usize>)>,
@@ -1130,6 +1143,9 @@ impl AppState {
             copy_text_object_pending: None,
             copy_register_pending: false,
             copy_register: None,
+            copy_mark: None,
+            copy_last_jump: None,
+            copy_refresh_live: false,
             named_registers: std::collections::HashMap::new(),
             display_map: Vec::new(),
             key_tables: std::collections::HashMap::new(),
@@ -1330,10 +1346,10 @@ pub enum Action {
 pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repeat: bool }
 
 pub enum CtrlReq {
-    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool),  // cmd, name, detached, start_dir, title (-T), empty (-E)
-    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E)
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T)
-    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T)
+    NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489)
+    NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E), env (-e, #489)
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489)
+    SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, Option<String>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>),  // kind, cmd, detached, start_dir, size (value, is_percent), format, resp, title (-T), env (-e, #489)
     /// new-pane: create a floating pane over the active window's layout.
     /// Flags match tmux: `-X`/`-Y` position, `-x`/`-y` size, `-B` border,
     /// `-T` title, `-c` dir, `-d` detached, `-P` print (returns the pane id).
@@ -1445,7 +1461,12 @@ pub enum CtrlReq {
     ToggleSync,
     SetPaneTitle(String),
     SetPaneStyle(String),
-    SendKeys(String, bool),
+    // send-keys arguments as SEPARATE tokens (#490): each token is either a
+    // named key (Enter, C-c, Up, ...) matched in its entirety or literal
+    // text typed verbatim with its whitespace intact. Never re-join and
+    // re-split on whitespace — that collapsed runs of spaces inside quoted
+    // arguments and stripped leading/trailing spaces.
+    SendKeys(Vec<String>, bool),
     SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String, bool),
     SelectWindow(usize),
@@ -1525,6 +1546,16 @@ pub enum CtrlReq {
     ShowOptions(mpsc::Sender<String>),
     ShowWindowOptions(mpsc::Sender<String>),
     SourceFile(String),
+    /// Expand `#{...}` format variables against the live server state and send
+    /// the result back: `(format_string, reply)`.
+    ///
+    /// Connection threads parse commands without access to `AppState` (it is an
+    /// owned local of the server loop, not shared behind a lock), so anything
+    /// they need format-expanded has to make this round trip. `run-shell` is the
+    /// motivating caller: its command was never expanded at all, so a bind like
+    /// `run-shell "helper --path '#{pane_current_path}'"` handed the helper that
+    /// literal string.
+    ExpandFormat(String, mpsc::Sender<String>),
     MoveWindow(Option<usize>),
     // (source display index, target display index); source None = active window
     SwapWindow(Option<usize>, usize),
@@ -1593,6 +1624,12 @@ pub enum CtrlReq {
     /// The String carries the resolved target session name (or "" for -n/-p/-l to be
     /// resolved server-side), and the second field carries the flag: 't', 'n', 'p', or 'l'.
     SwitchClient(String, char),
+    /// `switch-client -t <target>` where the target is a full
+    /// `session:window.pane` / `@window` / `%pane` spec (#483). The server loop
+    /// switches the client's session AND selects the addressed window/pane,
+    /// validates the target exists, and reports "OK" or "ERROR <reason>" back on
+    /// the channel so the CLI can exit non-zero on an unresolvable target.
+    SwitchClientTarget(String, mpsc::Sender<String>),
     LockClient,
     RefreshClient,
     /// `refresh-client -B name:what:format` subscription management.
@@ -1878,7 +1915,10 @@ pub fn parse_x11_color(s: &str) -> Option<(u8, u8, u8)> {
 /// that are not being piped pay nothing. The server handler (`CtrlReq::PipePane`)
 /// pushes/removes `(pane_id, child_stdin)` entries and keeps the count in sync.
 pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static PIPE_WRITERS: Mutex<Vec<(usize, std::process::ChildStdin)>> = Mutex::new(Vec::new());
+/// Writers are boxed so the same tee path serves both pipe-pane child stdins
+/// and cross-session forward tunnels (TcpStream) without a second reader
+/// competing for the ConPTY output pipe.
+pub static PIPE_WRITERS: Mutex<Vec<(usize, Box<dyn std::io::Write + Send>)>> = Mutex::new(Vec::new());
 
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly

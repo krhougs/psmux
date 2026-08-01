@@ -86,9 +86,9 @@ fn color_to_ansi(c: ratatui::style::Color, fg: bool) -> String {
     }
 }
 
-/// Returns Some(true) if the window spec (index or name) exists in the target
-/// server, Some(false) if it definitively does not, or None if the server could
-/// not be queried (in which case the caller should NOT block the command).
+/// Returns Some(true) if the window spec (id, index, or name) exists in the
+/// target server, Some(false) if it definitively does not, or None if the server
+/// could not be queried (in which case the caller should NOT block the command).
 /// Routing uses the already-set PSMUX_TARGET_SESSION (from the global -t parse).
 fn cli_window_exists(window_spec: &str) -> Option<bool> {
     // Clear PSMUX_TARGET_FULL for the query: it holds the (possibly bad) target
@@ -97,7 +97,7 @@ fn cli_window_exists(window_spec: &str) -> Option<bool> {
     let saved_full = std::env::var("PSMUX_TARGET_FULL").ok();
     std::env::remove_var("PSMUX_TARGET_FULL");
     let resp = crate::session::send_control_with_response(
-        "list-windows -F #{window_index}|#{window_name}\n".to_string(),
+        "list-windows -F #{window_id}|#{window_index}|#{window_name}\n".to_string(),
     );
     if let Some(v) = saved_full { std::env::set_var("PSMUX_TARGET_FULL", v); }
     let resp = resp.ok()?;
@@ -105,13 +105,14 @@ fn cli_window_exists(window_spec: &str) -> Option<bool> {
     for line in resp.lines() {
         let line = line.trim();
         if line.is_empty() || line == "OK" { continue; }
-        let mut parts = line.splitn(2, '|');
+        let mut parts = line.splitn(3, '|');
+        let id = parts.next().unwrap_or("").trim();
         let idx = parts.next().unwrap_or("").trim();
         let name = parts.next().unwrap_or("").trim();
-        // Only count lines that actually look like "<index>|<name>".
-        if idx.parse::<usize>().is_ok() {
+        // Only count lines that actually look like "@<id>|<index>|<name>".
+        if id.starts_with('@') && idx.parse::<usize>().is_ok() {
             any = true;
-            if idx == window_spec || name == window_spec { return Some(true); }
+            if id == window_spec || idx == window_spec || name == window_spec { return Some(true); }
         }
     }
     if any { Some(false) } else { None }
@@ -264,6 +265,14 @@ fn run_main() -> io::Result<()> {
     // Supports session:window.pane format (e.g., "dev:0.1")
     // PSMUX_TARGET_SESSION stores the port file base name (for port file lookup)
     // PSMUX_TARGET_FULL stores the full target (session:window.pane) for the server
+    //
+    // Tracks whether THIS command line supplied an explicit `-t <session>`. Only
+    // an explicit session target may pin routing; anything else (no -t, a pane/
+    // window-only target like `-t %2`, or switch-client) must fall through to the
+    // $TMUX-based resolution below so a stale PSMUX_TARGET_SESSION inherited from
+    // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
+    // hijack the current session. See issue #485.
+    let mut explicit_session_target = false;
     if let Some(pos) = args.iter().position(|a| a == "-t") {
         if let Some(target) = args.get(pos + 1) {
             // move-window/swap-window: a bare numeric -t is a WINDOW index (tmux
@@ -312,14 +321,20 @@ fn run_main() -> io::Result<()> {
             let is_switch_client = args.iter().any(|a| a == "switch-client" || a == "switchc");
             if has_explicit_session && !is_switch_client {
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
+                explicit_session_target = true;
             }
         }
     }
-    if env::var("PSMUX_TARGET_SESSION").is_err() {
-        // No explicit `-t session`: resolve which server to route to. `$TMUX`
-        // (set inside every psmux pane) names the current server; the `-L`
-        // namespace and the most-recent-session fallback are applied inside
-        // resolve_routing_target.
+    if !explicit_session_target {
+        // No explicit `-t session` on this command line: `$TMUX` (set inside
+        // every psmux pane and kept pointing at the live server) is the authority
+        // for which server we belong to. It must OVERRIDE any PSMUX_TARGET_SESSION
+        // inherited from the pane environment, because a warm-pool shell freezes
+        // that variable at `__warm__` (it names the server the pane was born in,
+        // not the session it was transplanted into). Guarding on `is_err()` here
+        // let that stale value win and routed queries like `display-message -p
+        // '#S'` to the wrong session (issue #485). The `-L` namespace and the
+        // most-recent-session fallback are applied inside resolve_routing_target.
         let psmux_dir = std::path::PathBuf::from(crate::paths::psmux_dir());
         let tmux_env = env::var("TMUX").ok();
         if let Some(name) = crate::session::resolve_routing_target(
@@ -1366,6 +1381,7 @@ fn run_main() -> io::Result<()> {
                 let mut start_dir: Option<String> = None;
                 let mut title_arg: Option<String> = None;
                 let mut empty_flag = false;
+                let mut env_args: Vec<String> = Vec::new();
                 let mut nw_positional: Vec<String> = Vec::new();
                 {
                     let mut i = 1;
@@ -1378,7 +1394,9 @@ fn run_main() -> io::Result<()> {
                             s if s.starts_with("-F") && s.len() > 2 => { format_str = Some(s[2..].trim_matches('"').to_string()); }
                             "-c" => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } }
                             "-T" => { i += 1; if i < cmd_args.len() { title_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
-                            "-t" | "-e" | "-S" => { i += 1; /* skip value */ }
+                            // -e KEY=VALUE environment for the new pane (#489)
+                            "-e" => { i += 1; if i < cmd_args.len() { env_args.push(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-t" | "-S" => { i += 1; /* skip value */ }
                             "-d" => { detached = true; }
                             "-P" => { print_info = true; }
                             "-E" => { empty_flag = true; }
@@ -1422,6 +1440,9 @@ fn run_main() -> io::Result<()> {
                 if let Some(dir) = &start_dir {
                     cmd_line.push_str(&format!(" -c \"{}\"", dir.replace("\"", "\\\"")));
                 }
+                for ev in &env_args {
+                    cmd_line.push_str(&format!(" -e \"{}\"", ev.replace("\"", "\\\"")));
+                }
                 if !cmd_arg.is_empty() {
                     cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
                 }
@@ -1449,6 +1470,7 @@ fn run_main() -> io::Result<()> {
                 let mut size_pct: Option<String> = None;
                 let mut size_cells: Option<String> = None;
                 let mut title_arg: Option<String> = None;
+                let mut env_args: Vec<String> = Vec::new();
                 let mut sw_positional: Vec<String> = Vec::new();
                 {
                     let mut i = 1;
@@ -1462,7 +1484,9 @@ fn run_main() -> io::Result<()> {
                             "-T" => { i += 1; if i < cmd_args.len() { title_arg = Some(cmd_args[i].trim_matches('"').to_string()); } }
                             "-p" => { i += 1; if i < cmd_args.len() { size_pct = Some(cmd_args[i].to_string()); size_cells = None; } }
                             "-l" => { i += 1; if i < cmd_args.len() { let v = cmd_args[i].to_string(); if v.ends_with('%') { size_pct = Some(v); size_cells = None; } else { size_cells = Some(v); size_pct = None; } } }
-                            "-t" | "-e" => { i += 1; /* skip value */ }
+                            // -e KEY=VALUE environment for the new pane (#489)
+                            "-e" => { i += 1; if i < cmd_args.len() { env_args.push(cmd_args[i].trim_matches('"').to_string()); } }
+                            "-t" => { i += 1; /* skip value */ }
                             "-h" => { flag = "-h"; }
                             "-v" => { flag = "-v"; }
                             "-d" => { detached = true; }
@@ -1501,6 +1525,9 @@ fn run_main() -> io::Result<()> {
                     cmd_line.push_str(&format!(" -p {}", pct));
                 } else if let Some(cells) = &size_cells {
                     cmd_line.push_str(&format!(" -l {}", cells));
+                }
+                for ev in &env_args {
+                    cmd_line.push_str(&format!(" -e \"{}\"", ev.replace("\"", "\\\"")));
                 }
                 if !cmd_arg.is_empty() {
                     cmd_line.push_str(&format!(" \"{}\"", cmd_arg.replace("\"", "\\\"")));
@@ -2567,11 +2594,47 @@ fn run_main() -> io::Result<()> {
                     eprintln!("usage: run-shell [-b] shell-command");
                     std::process::exit(1);
                 }
+                // `#{...}` can only be resolved against live server state, which
+                // this process does not have — the CLI path runs the command
+                // itself rather than going through the server. So when the
+                // command references a format variable, hand the whole thing to
+                // the server and let it run there (connection.rs expands, then
+                // executes). Without this, `psmux run-shell "x #{pane_id}"`
+                // passed the helper that literal text, exactly as the bind path
+                // used to.
+                if shell_cmd_str.contains("#{") {
+                    let mut line = String::from("run-shell");
+                    if background {
+                        line.push_str(" -b");
+                    }
+                    line.push(' ');
+                    line.push_str(&shell_cmd_str);
+                    line.push('\n');
+                    match crate::session::send_control_with_response(line) {
+                        Ok(resp) => {
+                            if !resp.is_empty() {
+                                io::stdout().write_all(resp.as_bytes())?;
+                            }
+                            return Ok(());
+                        }
+                        // No server reachable: fall through and run locally with
+                        // the format text unexpanded. That is the pre-existing
+                        // behaviour, and it beats refusing to run at all.
+                        Err(e) => {
+                            eprintln!("run-shell: {} (running without format expansion)", e);
+                        }
+                    }
+                }
                 let shell_cmd = crate::util::expand_run_shell_path(&shell_cmd_str);
                 // Run the command using the resolved shell
                 if background {
                     let mut c = crate::commands::build_run_shell_command(&shell_cmd);
-                    let _ = c.spawn();
+                    // Report a failure to START the command. `-b` waives the
+                    // output, not the error.
+                    if let Err(e) = c.spawn() {
+                        eprintln!("run-shell: {}: {}", shell_cmd, e);
+                        std::process::exit(1);
+                    }
                 } else {
                     let mut c = crate::commands::build_run_shell_command(&shell_cmd);
                     let output = c.output()?;
@@ -3233,7 +3296,19 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 cmd.push('\n');
-                send_control(cmd)?;
+                // #483: the server validates a -t target and replies "ERROR
+                // <reason>" for an unresolvable window/pane/session so scripts
+                // see a non-zero exit instead of a silent success. A missing/
+                // unreachable server keeps the old fire-and-forget behavior.
+                match send_control_with_response(cmd) {
+                    Ok(resp) => {
+                        if let Some(reason) = resp.trim().strip_prefix("ERROR ") {
+                            eprintln!("{}", reason);
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(_) => {}
+                }
                 return Ok(());
             }
             // copy-mode - Enter copy mode
@@ -3957,17 +4032,17 @@ fn run_main() -> io::Result<()> {
         return run_control_mode(control_mode);
     }
 
-    // Cygwin/MSYS pty detection (issue #474): under mintty (Git Bash, MSYS2)
-    // stdin/stdout are pty pipes, not a console. The client then reads VT
-    // bytes from the pipe and writes UTF-8 frames back to it instead of
-    // using console APIs (which fail with ERROR_INVALID_FUNCTION there).
-    let pipe_vt = crate::ssh_input::stdin_is_cygwin_pty();
+    // Raw VT pipe detection: under mintty (Git Bash/MSYS2, issue #474) and
+    // under `ssh -T` (the Win10 SSH mouse workaround), stdin/stdout are pipes,
+    // not a console. Read and write VT bytes directly instead of using console
+    // APIs or routing them through ConPTY.
+    let pipe_vt = crate::ssh_input::stdin_is_vt_pipe();
 
     // If stdin is not a terminal (headless/non-interactive environment, e.g.
     // winget validation pipeline), print version and exit cleanly — starting
     // a TUI session would fail without an interactive console. A Cygwin pty
     // IS a terminal (a human sits on the mintty side) even though it is
-    // technically a pipe.
+    // technically a pipe. The same is true of an interactive `ssh -T` channel.
     if !std::io::stdin().is_terminal() && !pipe_vt {
         print_version();
         return Ok(());
@@ -3991,9 +4066,9 @@ fn run_main() -> io::Result<()> {
     let mut stdout = crate::platform::create_writer();
     enable_virtual_terminal_processing();
     if pipe_vt {
-        // A Cygwin pty is already raw from the native side (no console line
-        // discipline in the path); enable_raw_mode would call SetConsoleMode
-        // on the pipe handle and fail with ERROR_INVALID_FUNCTION.
+        // The local wrapper (or Cygwin pty) is already raw on the terminal
+        // side; enable_raw_mode would call SetConsoleMode on this pipe handle
+        // and fail with ERROR_INVALID_FUNCTION.
         // crossterm's ANSI detection needs TERM set to take the pure-ANSI
         // path on Windows — mintty always sets it, but make sure.
         if env::var("TERM").is_err() {
@@ -4035,10 +4110,10 @@ fn run_main() -> io::Result<()> {
     };
 
     if pipe_vt {
-        // Learn the real terminal size over the pty (XTWINOPS) before the
+        // Learn the real terminal size over the pipe (XTWINOPS) before the
         // first draw; the reader thread records the reply for the backend.
-        // Also enable SGR mouse / focus / bracketed paste directly — mintty
-        // handles these natively.
+        // Also enable SGR mouse / focus / bracketed paste directly. With
+        // `ssh -T`, these bytes reach the client terminal without ConPTY.
         crate::ssh_input::pipe_send_modes_enable();
         crate::ssh_input::request_pipe_terminal_size();
         for _ in 0..50 {
@@ -4057,12 +4132,13 @@ fn run_main() -> io::Result<()> {
     let backend = crate::platform::PsmuxBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // For VT input mode (SSH / JetBrains), explicitly (re-)send mouse-enable
-    // escape sequences.  ConPTY may have consumed crossterm's
-    // EnableMouseCapture output without forwarding it.
-    if use_vt_input {
+    // For console-backed VT input (SSH / JetBrains), explicitly (re-)send
+    // mouse-enable escape sequences. ConPTY may have consumed crossterm's
+    // EnableMouseCapture output without forwarding it. Pipe mode already sent
+    // its safe mode set above and must not enter this ConPTY-specific path.
+    if use_vt_input && !pipe_vt {
         send_mouse_enable();
-    } else {
+    } else if !pipe_vt {
         // Local console: write the DECSET registration explicitly instead of
         // relying solely on ConPTY synthesizing it from ENABLE_MOUSE_INPUT.
         // Windows Terminal tracks this registration and can silently drop it

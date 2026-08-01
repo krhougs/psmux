@@ -302,8 +302,24 @@ unsafe impl Send for SessionMutex {}
 impl Drop for SessionMutex {
     fn drop(&mut self) {
         #[link(name = "kernel32")]
-        extern "system" { fn CloseHandle(h: isize) -> i32; }
-        if !self.handle.is_null() { unsafe { CloseHandle(self.handle as isize); } }
+        extern "system" {
+            fn ReleaseMutex(h: *mut std::ffi::c_void) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        if !self.handle.is_null() {
+            unsafe {
+                // Give up ownership explicitly before closing. Closing alone frees
+                // the name only when ours is the LAST handle; if any other process
+                // happens to hold one open at that instant (a concurrent probe from
+                // a starting server), the object outlives our close and would stay
+                // owned by a thread that has moved on. Releasing first makes the
+                // handover deterministic, which is what re-keying the guard across
+                // a rename depends on (issue #505). Harmlessly returns 0 when this
+                // thread does not own the mutex.
+                ReleaseMutex(self.handle);
+                CloseHandle(self.handle as isize);
+            }
+        }
     }
 }
 
@@ -1568,6 +1584,19 @@ pub mod mouse_inject {
         // the FreeConsole/AttachConsole dance below.
         let fg_is_shell = crate::platform::process_info::foreground_is_shell(child_pid)
             .unwrap_or(true);
+
+        // Issue #491: a VT bridge (wsl.exe, ssh.exe) reads raw bytes from its
+        // console and forwards 0x03 into the guest as SIGINT itself, so the
+        // console-wide CTRL_C_EVENT broadcast below is redundant for it — and
+        // fatal when the bridge was launched from a Cygwin/MSYS shell (Git
+        // Bash, MSYS2, Cygwin): the shell reacts to the broadcast by
+        // delivering SIGINT to its native foreground child, which the Cygwin
+        // runtime implements as a hard kill of wsl.exe.  Deliver only the raw
+        // 0x03 the call site writes and skip the signal.
+        if crate::platform::process_info::foreground_is_vt_bridge(child_pid) {
+            log(&format!("vt-bridge foreground under pid={}: deliver raw 0x03 only, skip CTRL_C_EVENT", child_pid));
+            return false;
+        }
 
         let _console_guard = portable_pty::console_state_lock();
         unsafe {
@@ -2876,11 +2905,32 @@ pub mod process_info {
     }
 
     /// Append a line to ~/.psmux/autorename.log (first 100 entries only).
+    ///
+    /// Gated on `PSMUX_AUTORENAME_DEBUG=1`, like every other logger in
+    /// `src/debug_log.rs`. It was previously UNGATED — the only logger in the
+    /// tree that was — so every psmux server ever run wrote up to 100 lines of
+    /// process-tree tracing from this hot path, with an open+append syscall per
+    /// line. On this developer's machine it had accumulated a 703KB file. The
+    /// 100-entry cap is per-process, so the file grows without bound across
+    /// server restarts and the cap gives no protection against that.
     fn autorename_log(msg: &str) {
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            // Accept "1" or "true", matching debug_log.rs's env_enabled so every
+            // debug gate in the tree behaves the same way.
+            std::env::var("PSMUX_AUTORENAME_DEBUG")
+                .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"))
+        }) {
+            return;
+        }
         static COUNT: AtomicU32 = AtomicU32::new(0);
         let n = COUNT.fetch_add(1, Ordering::Relaxed);
-        if n > 100 { return; }
+        // fetch_add returns the PREVIOUS value, so `>= 100` caps at exactly 100
+        // writes (n = 0..=99); `> 100` allowed 101. This cap predates the branch;
+        // aligned with the "first 100 entries" doc while touching the function.
+        if n >= 100 { return; }
         let path = format!("{}/autorename.log", crate::paths::psmux_dir());
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             use std::io::Write;
@@ -2962,77 +3012,168 @@ pub mod process_info {
     /// look one level deeper so the meaningful program is returned instead
     /// of the wrapper.
     fn find_foreground_child_pid(root_pid: u32) -> Option<u32> {
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE || snap == 0 {
+        // Render-path caller: reuse a recent snapshot rather than walking every
+        // process on the machine per repaint. See `process_table`.
+        let entries = match process_table(RENDER_PATH_TTL) {
+            Some(t) => t,
+            None => {
                 autorename_log(&format!("root={} SNAPSHOT FAILED", root_pid));
                 return None;
             }
+        };
 
-            // Collect (pid, ppid, exe_name_lower) for every process.
-            let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(512);
-            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
-            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
 
-            if Process32FirstW(snap, &mut pe) != 0 {
-                let name = exe_name_from_entry(&pe);
-                entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
-                while Process32NextW(snap, &mut pe) != 0 {
-                    let name = exe_name_from_entry(&pe);
-                    entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
-                }
-            }
-            CloseHandle(snap);
+        // Immediate children of root_pid, skipping system processes.
+        let direct: Vec<(u32, String)> = entries.iter()
+            .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
+            .map(|(pid, _, name)| (*pid, name.clone()))
+            .collect();
 
-            autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
+        for (pid, name) in &direct {
+            autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
+        }
 
-            // Immediate children of root_pid, skipping system processes.
-            let direct: Vec<(u32, String)> = entries.iter()
-                .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
+        if direct.is_empty() {
+            autorename_log(&format!("root={} no_direct_children", root_pid));
+            return None;
+        }
+
+        // Pick the immediate child.  When multiple exist, prefer the
+        // largest PID (most recently created).
+        let (mut chosen_pid, chosen_name) = direct.iter()
+            .max_by_key(|(pid, _)| *pid)
+            .map(|(pid, name)| (*pid, name.clone()))
+            .unwrap();
+
+        autorename_log(&format!("root={} immediate_child={} name={}", root_pid, chosen_pid, chosen_name));
+
+        // If the immediate child is a known wrapper (cmd, bash, npx, ...),
+        // look one level deeper for the real program.
+        if is_wrapper_exe(&chosen_name) {
+            let grandchildren: Vec<(u32, String)> = entries.iter()
+                .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
                 .map(|(pid, _, name)| (*pid, name.clone()))
                 .collect();
 
-            for (pid, name) in &direct {
-                autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
-            }
-
-            if direct.is_empty() {
-                autorename_log(&format!("root={} no_direct_children", root_pid));
-                return None;
-            }
-
-            // Pick the immediate child.  When multiple exist, prefer the
-            // largest PID (most recently created).
-            let (mut chosen_pid, chosen_name) = direct.iter()
+            if let Some((gc_pid, gc_name)) = grandchildren.iter()
                 .max_by_key(|(pid, _)| *pid)
-                .map(|(pid, name)| (*pid, name.clone()))
-                .unwrap();
+            {
+                autorename_log(&format!(
+                    "root={} wrapper={} skip_to_grandchild={} name={}",
+                    root_pid, chosen_name, gc_pid, gc_name
+                ));
+                chosen_pid = *gc_pid;
+            }
+        }
 
-            autorename_log(&format!("root={} immediate_child={} name={}", root_pid, chosen_pid, chosen_name));
+        autorename_log(&format!("root={} selected={}", root_pid, chosen_pid));
+        Some(chosen_pid)
+    }
 
-            // If the immediate child is a known wrapper (cmd, bash, npx, ...),
-            // look one level deeper for the real program.
-            if is_wrapper_exe(&chosen_name) {
-                let grandchildren: Vec<(u32, String)> = entries.iter()
-                    .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
-                    .map(|(pid, _, name)| (*pid, name.clone()))
-                    .collect();
+    /// One `(pid, ppid, lowercased_exe_name)` row per process on the machine.
+    type ProcTable = std::sync::Arc<Vec<(u32, u32, String)>>;
 
-                if let Some((gc_pid, gc_name)) = grandchildren.iter()
-                    .max_by_key(|(pid, _)| *pid)
-                {
-                    autorename_log(&format!(
-                        "root={} wrapper={} skip_to_grandchild={} name={}",
-                        root_pid, chosen_name, gc_pid, gc_name
-                    ));
-                    chosen_pid = *gc_pid;
+    static PROC_TABLE_CACHE: std::sync::LazyLock<
+        std::sync::Mutex<Option<(std::time::Instant, ProcTable)>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+    thread_local! {
+        /// Count of REAL `CreateToolhelp32Snapshot` walks performed by THIS
+        /// thread, as opposed to cache hits. The whole point of this module's
+        /// caching is a number that does not scale with the frame rate, so the
+        /// number is made observable rather than inferred from a timing
+        /// measurement, which would be flaky on a loaded machine.
+        ///
+        /// Per-thread rather than global specifically so the tests are not at
+        /// the mercy of the parallel test suite: several other test modules
+        /// reach this code through `#{pane_current_command}` and friends, and a
+        /// global counter would let their walks inflate another test's delta.
+        pub(crate) static PROC_TABLE_WALKS: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// Enumerate every process on the machine, with an optional freshness bound.
+    ///
+    /// `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` walks the whole system —
+    /// ~340 processes on a normal desktop — and three separate functions here
+    /// used to do it independently, with their own identical copy of the
+    /// enumeration loop and no caching between them.
+    ///
+    /// That was fine when the callers were rare (a Ctrl+C, a mouse click) and
+    /// catastrophic once `#{pane_current_command}` and `#{pane_current_path}`
+    /// reached it: both are expanded on the server's per-output render path, so
+    /// a status bar or window title referencing them took TWO full snapshots per
+    /// repaint — i.e. per keystroke, on the same thread that delivers keystrokes
+    /// to ConPTY. `window_ops::scroll_foreground_classify` had already hit this
+    /// and worked around it with its own 2s per-pane cache; the format path had
+    /// no such guard.
+    ///
+    /// `max_age` is per-caller on purpose rather than a single global TTL:
+    /// reusing a snapshot changes what a caller can observe, and the paths that
+    /// route Ctrl+C and mouse events are not places to introduce staleness for a
+    /// performance win they do not need. They pass `Duration::ZERO` and always
+    /// enumerate fresh; only the render-path callers opt into reuse.
+    ///
+    /// Returns `None` only when the snapshot itself fails. Failures are never
+    /// cached.
+    fn process_table(max_age: std::time::Duration) -> Option<ProcTable> {
+        if !max_age.is_zero() {
+            // Recover a poisoned lock rather than skipping the cache. The inner
+            // value is only ever a fully-published entry or None (the critical
+            // sections are a single assignment / a clone), so `into_inner` is
+            // safe, and silently disabling the cache for the rest of the process
+            // after some unrelated panic is the outcome worth avoiding. Matches
+            // the recovery the tests use.
+            let guard = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, table)) = guard.as_ref() {
+                if at.elapsed() < max_age {
+                    return Some(std::sync::Arc::clone(table));
                 }
             }
-
-            autorename_log(&format!("root={} selected={}", root_pid, chosen_pid));
-            Some(chosen_pid)
         }
+
+        PROC_TABLE_WALKS.with(|c| c.set(c.get() + 1));
+        let entries = unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE || snap == 0 {
+                return None;
+            }
+            let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(512);
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut pe) != 0 {
+                entries.push((pe.th32_process_id, pe.th32_parent_process_id, exe_name_from_entry(&pe)));
+                while Process32NextW(snap, &mut pe) != 0 {
+                    entries.push((pe.th32_process_id, pe.th32_parent_process_id, exe_name_from_entry(&pe)));
+                }
+            }
+            CloseHandle(snap);
+            entries
+        };
+
+        let table: ProcTable = std::sync::Arc::new(entries);
+        // Publish even for a ZERO-max_age caller: it paid for the walk, so a
+        // later render-path caller may as well reuse it. Recover a poisoned lock
+        // here too (see the read site above) so a panic elsewhere cannot leave
+        // the cache permanently unpopulated.
+        {
+            let mut guard = PROC_TABLE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some((std::time::Instant::now(), std::sync::Arc::clone(&table)));
+        }
+        Some(table)
     }
+
+    /// Freshness bound for the render path (`#{pane_current_command}`,
+    /// `#{pane_current_path}`, automatic-rename).
+    ///
+    /// These feed a status bar and a window title, where a fraction of a second
+    /// of lag is invisible, and they are re-expanded on every frame. 250ms caps
+    /// the cost at 4 snapshots/second no matter how fast a pane is drawing,
+    /// while still updating a window title fast enough to look instant.
+    /// automatic-rename separately throttles itself to 1/s per pane, so it is
+    /// unaffected by this bound in practice.
+    const RENDER_PATH_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
     /// Extract the lowercased executable name from a PROCESSENTRY32W.
     fn exe_name_from_entry(pe: &PROCESSENTRY32W) -> String {
@@ -3085,60 +3226,64 @@ pub mod process_info {
     ///   `None`        — the process snapshot could not be taken; the caller
     ///                   should fall back to its default behavior.
     pub fn foreground_is_shell(root_pid: u32) -> Option<bool> {
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE || snap == 0 {
-                return None;
-            }
+        match foreground_leaf_name(root_pid)? {
+            Some(name) => Some(is_shell_exe(&name) || is_vt_bridge_exe(&name)),
+            // Root not present in the snapshot (rare race): default to shell
+            // so the established interrupt behavior is preserved.
+            None => Some(true),
+        }
+    }
 
-            let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(512);
-            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
-            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snap, &mut pe) != 0 {
-                entries.push((pe.th32_process_id, pe.th32_parent_process_id, exe_name_from_entry(&pe)));
-                while Process32NextW(snap, &mut pe) != 0 {
-                    entries.push((pe.th32_process_id, pe.th32_parent_process_id, exe_name_from_entry(&pe)));
+    /// True when the pane's deepest foreground process is a VT bridge
+    /// (wsl.exe, ssh.exe, ...).  Used by the Ctrl+C router (issue #491):
+    /// bridges read raw bytes from their console and forward 0x03 into the
+    /// guest as SIGINT themselves, so they must NOT be hit with a
+    /// console-wide CTRL_C_EVENT broadcast.
+    pub fn foreground_is_vt_bridge(root_pid: u32) -> bool {
+        matches!(foreground_leaf_name(root_pid), Some(Some(name)) if is_vt_bridge_exe(&name))
+    }
+
+    /// Snapshot the process table and resolve the deepest foreground leaf
+    /// under `root_pid`.  Outer `None` = snapshot failed; inner `None` =
+    /// root absent from the snapshot (rare race).
+    ///
+    /// Routes through the shared `process_table()` cache like the other walkers
+    /// in this module. Both callers (`foreground_is_shell`,
+    /// `foreground_is_vt_bridge`) run on the Ctrl+C path — real user input, not
+    /// per frame — so this passes `Duration::ZERO` and always enumerates fresh:
+    /// misrouting an interrupt off a stale process tree would be a real bug.
+    fn foreground_leaf_name(root_pid: u32) -> Option<Option<String>> {
+        let entries = process_table(std::time::Duration::ZERO)?;
+
+        // Descend to the deepest foreground leaf, skipping system
+        // processes, by following the highest-PID child at each level
+        // (a most-recently-created heuristic).  The iteration guard
+        // prevents pathological loops from PID-reuse cycles in the snapshot.
+        let mut cur = root_pid;
+        let mut leaf_name: Option<String> = None;
+        for _ in 0..64 {
+            let next = entries.iter()
+                .filter(|(pid, ppid, name)| *ppid == cur && *pid != cur && !is_system_exe(name))
+                .max_by_key(|(pid, _, _)| *pid);
+            match next {
+                Some((pid, _, name)) => {
+                    cur = *pid;
+                    leaf_name = Some(name.clone());
                 }
-            }
-            CloseHandle(snap);
-
-            // Descend to the deepest foreground leaf, skipping system
-            // processes, by following the highest-PID child at each level
-            // (a most-recently-created heuristic).  The iteration guard
-            // prevents pathological loops from PID-reuse cycles in the snapshot.
-            let mut cur = root_pid;
-            let mut leaf_name: Option<String> = None;
-            for _ in 0..64 {
-                let next = entries.iter()
-                    .filter(|(pid, ppid, name)| *ppid == cur && *pid != cur && !is_system_exe(name))
-                    .max_by_key(|(pid, _, _)| *pid);
-                match next {
-                    Some((pid, _, name)) => {
-                        cur = *pid;
-                        leaf_name = Some(name.clone());
-                    }
-                    None => break,
-                }
-            }
-
-            // The process whose Ctrl+C behavior matters is the deepest
-            // foreground leaf.  If the root has no children, classify the root
-            // itself — a bare shell prompt resolves to pwsh/cmd (shell), while a
-            // directly-exec'd pane (create_window_raw) resolves to the program
-            // it ran, which may be a live TUI that must NOT be force-signalled.
-            let fg_name = leaf_name.or_else(|| {
-                entries.iter()
-                    .find(|(pid, _, _)| *pid == root_pid)
-                    .map(|(_, _, name)| name.clone())
-            });
-
-            match fg_name {
-                Some(name) => Some(is_shell_exe(&name) || is_vt_bridge_exe(&name)),
-                // Root not present in the snapshot (rare race): default to shell
-                // so the established interrupt behavior is preserved.
-                None => Some(true),
+                None => break,
             }
         }
+
+        // The process whose Ctrl+C behavior matters is the deepest
+        // foreground leaf.  If the root has no children, classify the root
+        // itself — a bare shell prompt resolves to pwsh/cmd (shell), while a
+        // directly-exec'd pane (create_window_raw) resolves to the program
+        // it ran, which may be a live TUI that must NOT be force-signalled.
+        Some(leaf_name.or_else(|| {
+            entries.iter()
+                .find(|(pid, _, _)| *pid == root_pid)
+                .map(|(_, _, name)| name.clone())
+        }))
     }
 
     /// Walk the process tree from `root_pid` and check if any descendant
@@ -3146,44 +3291,40 @@ pub mod process_info {
     /// This is used for mouse injection: VT bridge processes need VT mouse
     /// sequences written to the PTY master, not Win32 MOUSE_EVENT records.
     pub fn has_vt_bridge_descendant(root_pid: u32) -> bool {
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap == INVALID_HANDLE || snap == 0 { return false; }
+        // ZERO max_age, same reasoning as foreground_is_shell: this picks the
+        // mouse-injection transport for a real click, and its callers in
+        // window_ops already keep their own 2s per-pane cache in front of it.
+        let entries = match process_table(std::time::Duration::ZERO) {
+            Some(t) => t,
+            None => return false,
+        };
 
-            let mut entries: Vec<(u32, u32, String)> = Vec::with_capacity(256);
-            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
-            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-            if Process32FirstW(snap, &mut pe) != 0 {
-                let name = exe_name_from_entry(&pe);
-                entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
-                while Process32NextW(snap, &mut pe) != 0 {
-                    let name = exe_name_from_entry(&pe);
-                    entries.push((pe.th32_process_id, pe.th32_parent_process_id, name));
-                }
-            }
-            CloseHandle(snap);
-
-            // BFS from root_pid to check all descendants
-            let mut queue: Vec<u32> = vec![root_pid];
-            let mut head = 0;
-            while head < queue.len() {
-                let parent = queue[head];
-                head += 1;
-                for (pid, ppid, name) in &entries {
-                    if *ppid == parent && *pid != root_pid
-                        && !queue.contains(pid)
-                    {
-                        if is_vt_bridge_exe(name) {
-                            return true;
-                        }
-                        queue.push(*pid);
+        // BFS from root_pid to check all descendants
+        let mut queue: Vec<u32> = vec![root_pid];
+        let mut head = 0;
+        while head < queue.len() {
+            let parent = queue[head];
+            head += 1;
+            for (pid, ppid, name) in entries.iter() {
+                if *ppid == parent && *pid != root_pid
+                    && !queue.contains(pid)
+                {
+                    if is_vt_bridge_exe(name) {
+                        return true;
                     }
+                    queue.push(*pid);
                 }
             }
-            false
         }
+        false
     }
+
+    // Path is relative to src/platform/process_info/ — an inline module inside a
+    // file-based module adds a directory level, so this needs one more `..` than
+    // the equivalent declaration in src/server/helpers.rs.
+    #[cfg(test)]
+    #[path = "../../../tests-rs/test_proc_table_cache.rs"]
+    mod tests_proc_table_cache;
 }
 
 #[cfg(not(windows))]
@@ -3194,6 +3335,7 @@ pub mod process_info {
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
     pub fn has_vt_bridge_descendant(_root_pid: u32) -> bool { false }
     pub fn foreground_is_shell(_root_pid: u32) -> Option<bool> { None }
+    pub fn foreground_is_vt_bridge(_root_pid: u32) -> bool { false }
 }
 
 // ─── UTF-16 Console Writer (Windows) ────────────────────────────────────
@@ -3979,7 +4121,7 @@ mod tests_ctrlc_shell_classify;
 /// to the console size APIs.
 static PIPE_TERM_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Record the real terminal size reported over the pty (issue #474).
+/// Record the real terminal size reported over a raw VT pipe.
 pub fn set_pipe_term_size(cols: u16, rows: u16) {
     if cols == 0 || rows == 0 {
         return;
@@ -3999,10 +4141,10 @@ pub fn pipe_term_size() -> Option<(u16, u16)> {
 
 /// TUI backend for the psmux client: [`ratatui::backend::CrosstermBackend`]
 /// over [`PsmuxWriter`], with one twist — `size()`/`window_size()` consult the
-/// pipe-mode override first so a client attached over a Cygwin pty (mintty,
-/// issue #474) renders at the real terminal size even though the console
-/// size APIs cannot see that terminal. Outside pipe mode the override is
-/// never set and every call delegates.
+/// pipe-mode override first so a client attached over a Cygwin pty or a
+/// no-ConPTY SSH channel renders at the real terminal size even though the
+/// console size APIs cannot see that terminal. Outside pipe mode the override
+/// is never set and every call delegates.
 pub struct PsmuxBackend {
     inner: ratatui::backend::CrosstermBackend<PsmuxWriter>,
 }
