@@ -3492,6 +3492,7 @@ fn dispatch_control_command(
                 if !bytes.is_empty() {
                     let _ = tx.send(CtrlReq::SendBytes(bytes));
                 }
+                let _ = resp_tx.send(String::new());
                 return true;
             }
             // Convert real-tmux 0xNN hex codepoint syntax (used by iTerm2 for
