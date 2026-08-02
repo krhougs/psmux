@@ -1,12 +1,14 @@
 // `send-keys -H` is a byte channel: every operand is one hexadecimal byte value
 // that reaches the pty verbatim (tmux flags those keys KEYC_LITERAL and
-// input_key.c writes them as single bytes). psmux accepted the flag but never
-// implemented it, so the operands fell through to the key-name lookup and were
-// echoed into the pane as literal text -- typing `echo` produced "65 63 68 6f".
+// input_key.c writes them as single bytes). psmux already decoded the operands
+// and delivered the bytes, but its control dispatcher returned `handled`
+// without completing the response oneshot. The command reached the pane, but
+// dropping the sender was immediately misreported as a generic timeout error.
 //
-// These tests pin the two pure functions the fix rests on:
-//   * decode_send_command  -- per-command operand decoding
-//   * coalesce_send_commands -- merging consecutive sub-commands on one line
+// These tests keep the byte/codepoint contract separate from the completion
+// fix: decode_send_command handles per-command operands,
+// coalesce_send_commands merges consecutive sub-commands, and the dispatcher
+// must acknowledge the resulting byte write.
 //
 // They deliberately start no server (see AGENTS.md).
 
@@ -46,7 +48,7 @@ fn control_dispatch_acknowledges_literal_byte_send() {
         response_rx
             .recv_timeout(Duration::from_millis(100))
             .unwrap(),
-        ""
+        ControlCommandResponse::empty()
     );
     match request_rx.recv_timeout(Duration::from_millis(100)).unwrap() {
         CtrlReq::SendBytes(bytes) => assert_eq!(bytes, vec![0x41, 0xe4, 0xb8, 0xad]),
