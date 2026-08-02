@@ -11,6 +11,8 @@
 // They deliberately start no server (see AGENTS.md).
 
 use super::*;
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn decode(line: &str) -> Option<(String, Vec<u8>)> {
     decode_send_command(line)
@@ -22,6 +24,34 @@ fn literal_byte_operands_decode_to_raw_bytes() {
     let (target, bytes) = decode("send-keys -H -t %1 65 63 68 6f").expect("must decode");
     assert_eq!(target, "%1");
     assert_eq!(bytes, b"echo");
+}
+
+#[test]
+fn control_dispatch_acknowledges_literal_byte_send() {
+    let (request_tx, request_rx) = mpsc::channel();
+    let (response_tx, response_rx) = mpsc::channel();
+    let args = ["-H", "-t", "%1", "41", "e4", "b8", "ad"];
+
+    assert!(dispatch_control_command(
+        "send-keys",
+        &args,
+        &request_tx,
+        response_tx,
+        Some(1),
+        true,
+        Some("%1"),
+        1,
+    ));
+    assert_eq!(
+        response_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap(),
+        ""
+    );
+    match request_rx.recv_timeout(Duration::from_millis(100)).unwrap() {
+        CtrlReq::SendBytes(bytes) => assert_eq!(bytes, vec![0x41, 0xe4, 0xb8, 0xad]),
+        _ => panic!("literal-byte send dispatched the wrong request"),
+    }
 }
 
 #[test]
