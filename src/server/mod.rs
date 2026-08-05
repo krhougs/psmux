@@ -434,6 +434,14 @@ fn drain_plugin_req(
                 app.user_options.remove(&option);
             }
         }
+        CtrlReq::SetOptionToggle(option) => {
+            // `set -g <bool-option>` with no value flips it (#535). The client
+            // cannot compute the new value itself: only the server knows the
+            // current one, so the toggle has to happen here.
+            if crate::server::options::toggle_option(app, &option) {
+                app.user_set_options.insert(option.clone());
+            }
+        }
         CtrlReq::SetOptionOnlyIfUnset(option, value) => {
             // Only set if the option hasn't been explicitly set by user/config.
             // For @-prefixed user options, check if the key exists.
@@ -489,6 +497,10 @@ fn drain_plugin_req(
             app.key_tables.clear();
             crate::config::populate_default_bindings(app);
             crate::config::source_file(app, &path);
+            // A runtime source-file can record warnings (e.g. an unreadable
+            // path); flush them like the startup load does or they never
+            // reach config-warnings.log and the attach-time summary.
+            write_config_warnings_log(&app.config_warnings);
             // source-file may change pane-border-status (#288)
             resize_all_panes(app);
         }
@@ -737,10 +749,30 @@ pub(crate) fn read_fresh_config_warnings(since_epoch: u64) -> Vec<String> {
 /// Release before acquiring so renaming a session onto a name it already holds
 /// cannot block on itself. A refused acquire is not fatal: the rename has
 /// already happened, so we simply run unguarded rather than abandon the session.
-/// Warm servers stay exempt (the pool intentionally runs several at once).
+/// Warm servers are guarded too: a namespace holds exactly one `__warm__`
+/// server, and releasing that name here is precisely what lets the replacement
+/// warm spawned after a claim acquire it (issue #459).
+/// Remove the window at Vec position `pos`, killing its children. The last
+/// window's children are killed in place (the empty-session reaper then ends
+/// the server), matching the historical kill-window behavior. `active_idx`
+/// shifts down when a window before it is removed so focus stays on the same
+/// window; it only moves when the active window itself was the target.
+fn kill_window_at(app: &mut AppState, pos: usize) {
+    if pos >= app.windows.len() { return; }
+    if app.windows.len() > 1 {
+        let mut win = app.windows.remove(pos);
+        kill_all_children(&mut win.root);
+        app.on_window_removed(pos);
+        if app.active_idx > pos { app.active_idx -= 1; }
+        if app.active_idx >= app.windows.len() { app.active_idx = app.windows.len() - 1; }
+    } else {
+        // Last window: kill all children; reaper will detect empty session and exit
+        kill_all_children(&mut app.windows[0].root);
+    }
+}
+
 fn rekey_session_guard(guard: &mut Option<crate::platform::SessionMutex>, new_base: &str) {
     *guard = None; // drop releases + closes the old name's mutex
-    if crate::session::is_warm_session(new_base) { return; }
     *guard = crate::platform::acquire_session_mutex(new_base);
     if guard.is_none() {
         warm_debug(&format!("session guard: '{}' already owned by a live server — running unguarded", new_base));
@@ -791,15 +823,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // a cold-spawn race (has-session false-negatived under load, or two
     // `new-session -s X` raced) — exit cleanly so the winner stays the single
     // source of truth. Two servers on one name desync the .port/.key files and
-    // wedge the session ("appears lost"). Warm (standby) servers are exempt (the
-    // warm pool intentionally runs several). Fail-open: any FFI hiccup yields a
-    // live guard, never a blocked legitimate start.
+    // wedge the session ("appears lost"). Warm (standby) servers are guarded on
+    // the same terms: `__warm__.port` is a single file, so a namespace can only
+    // ever publish one warm server, and an unguarded warm name let every failed
+    // or slow registration strand another live process (issue #459). Fail-open:
+    // any FFI hiccup yields a live guard, never a blocked legitimate start.
     // Re-keyed on every rename/claim, see rekey_session_guard (issue #505).
     let mut session_guard = {
         let base = app.port_file_base();
-        if crate::session::is_warm_session(&base) {
-            None
-        } else {
+        {
             match crate::platform::acquire_session_mutex(&base) {
                 Some(g) => Some(g),
                 None => {
@@ -814,6 +846,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // commands spawned by load_config can connect back to the server.
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
+    // Keep a sender in AppState so loop-resident code can queue follow-up work
+    // (see the field's doc comment — copy-mode key tables need this).
+    app.control_tx = Some(tx.clone());
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     app.control_port = Some(port);
@@ -1507,7 +1542,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let cmdstr = cmd.clone().unwrap_or_default();
                         let sd = start_dir.clone().map(|d| expand_format(&d, &app)).filter(|d| !d.is_empty());
                         let pane_id = app.next_pane_id;
-                        if let Some(mut pane) = crate::popup::create_popup_pane(&cmdstr, sd.as_deref(), inner_h, inner_w, pane_id, &app.session_name, &app.environment) {
+                        if let Some(mut pane) = crate::popup::create_popup_pane(&cmdstr, sd.as_deref(), inner_h, inner_w, pane_id, &app.session_name, &app.environment, app.host_colors.as_ref()) {
                             app.next_pane_id += 1;
                             let t = title.clone().unwrap_or_default();
                             if !t.is_empty() { pane.title = t.clone(); pane.title_locked = true; }
@@ -3010,16 +3045,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(lines.join("\n"));
                 }
                 CtrlReq::KillWindow => {
-                    if app.windows.len() > 1 {
-                        let removed_pos = app.active_idx;
-                        let mut win = app.windows.remove(removed_pos);
-                        kill_all_children(&mut win.root);
-                        app.on_window_removed(removed_pos);
-                        if app.active_idx >= app.windows.len() { app.active_idx = app.windows.len() - 1; }
-                    } else {
-                        // Last window: kill all children; reaper will detect empty session and exit
-                        kill_all_children(&mut app.windows[0].root);
-                    }
+                    let active = app.active_idx;
+                    kill_window_at(&mut app, active);
                     // Killing a window changes the active window and the window
                     // list, so resize the now-active window's panes and force a
                     // status-bar/window-list rebuild + push to attached clients.
@@ -3033,6 +3060,49 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     meta_dirty = true;
                     state_dirty = true;
                     hook_event = Some("window-closed");
+                }
+                CtrlReq::KillWindowTarget { win, win_is_id, name, resp } => {
+                    // Resolve the target here, on live state. An unresolvable
+                    // target must be an error, never a fallback to the active
+                    // window: the old temp-focus-then-kill dance silently
+                    // no-opped the focus on a bad name/index/@id and then
+                    // killed whatever was focused (session death when it was
+                    // the last window). tmux: "can't find window: X", kills
+                    // nothing, exit 1.
+                    let resolved = if let Some(w) = win {
+                        if win_is_id {
+                            app.windows.iter().position(|x| x.id == w)
+                        } else {
+                            app.win_pos(w)
+                        }
+                    } else if let Some(ref n) = name {
+                        app.windows.iter().position(|x| x.name == *n)
+                    } else {
+                        Some(app.active_idx)
+                    };
+                    match resolved {
+                        Some(pos) => {
+                            kill_window_at(&mut app, pos);
+                            resize_all_panes(&mut app);
+                            meta_dirty = true;
+                            state_dirty = true;
+                            hook_event = Some("window-closed");
+                            let _ = resp.send(Ok(()));
+                        }
+                        None => {
+                            let spec = if let Some(w) = win {
+                                if win_is_id { format!("@{}", w) } else { w.to_string() }
+                            } else {
+                                name.clone().unwrap_or_default()
+                            };
+                            let msg = format!("can't find window: {}", spec);
+                            // Surface in the status bar for attached clients,
+                            // same convention as join-pane (#437).
+                            app.status_message = Some((msg.clone(), Instant::now(), None));
+                            state_dirty = true;
+                            let _ = resp.send(Err(msg));
+                        }
+                    }
                 }
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
@@ -3148,8 +3218,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let _ = std::fs::write(&new_path, port.to_string());
                     }
                     app.session_name = name;
-                    // A warm server skipped the startup guard (the pool runs several),
-                    // so the name it just claimed picks the guard up here (#505).
+                    // Move the guard from `__warm__` onto the claimed name (#505).
+                    // Releasing the warm name is what frees it for the replacement
+                    // warm spawned further below (issue #459).
                     rekey_session_guard(&mut session_guard, &app.port_file_base());
                     // Warm server's created_at is the warm process start time, not the
                     // user's session-creation time — reset on claim or list-sessions /
@@ -3843,6 +3914,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
+                CtrlReq::SetOptionToggle(option) => {
+                    // `set -g <bool-option>` with no value flips it (#535).
+                    // Only the server knows the current value, so the flip has
+                    // to happen here rather than client-side.
+                    if crate::server::options::toggle_option(&mut app, &option) {
+                        app.user_set_options.insert(option.clone());
+                        let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                        crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                        meta_dirty = true;
+                        state_dirty = true;
+                    }
+                }
                 CtrlReq::SetOptionOnlyIfUnset(option, value) => {
                     let already_set = if option.starts_with('@') {
                         app.user_options.contains_key(&option)
@@ -4014,6 +4097,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         crate::config::source_file(&mut app, &path);
                     }
+                    // A runtime source-file can record warnings (e.g. an
+                    // unreadable path); flush them like the startup load does
+                    // or they never reach config-warnings.log.
+                    write_config_warnings_log(&app.config_warnings);
                     let sync = crate::warm_pane_sync::for_config_reload();
                     crate::warm_pane_sync::apply_runtime(
                         &mut app,
@@ -4870,6 +4957,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.next_pane_id,
                         &app.session_name,
                         &app.environment,
+                        app.host_colors.as_ref(),
                     );
                     if let Some(prev) = saved_dir { let _ = env::set_current_dir(prev); }
 
@@ -4933,6 +5021,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             pane_id,
                             &app.session_name,
                             &app.environment,
+                            app.host_colors.as_ref(),
                         )
                     };
                     if let Some(mut pane) = pane_opt {
@@ -6181,3 +6270,7 @@ mod test_issue167_startup_log;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
 mod test_issue370_startup_error_passthrough;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue459_warm_single_instance.rs"]
+mod test_issue459_warm_single_instance;

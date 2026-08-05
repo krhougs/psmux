@@ -597,6 +597,18 @@ pub struct AppState {
     /// Current key table for switch-client -T (None = normal mode)
     pub current_key_table: Option<String>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
+    /// Sender for the same channel `control_rx` receives on, so code already
+    /// running ON the server loop can queue follow-up work for a later
+    /// iteration instead of recursing.
+    ///
+    /// Used by the copy-mode key tables: a `bind -T copy-mode-vi y send-keys -X
+    /// copy-pipe-and-cancel "clip.exe"` resolves while handling a keystroke, and
+    /// the `send-keys -X` implementation lives in the loop's own
+    /// `CtrlReq::SendKeysX` arm. Re-entering it directly is not possible, and
+    /// routing back out through `execute_command_string` would make the server
+    /// open a TCP connection to itself while the loop is blocked doing so —
+    /// a deadlock. Queueing costs one loop iteration and cannot deadlock.
+    pub control_tx: Option<mpsc::Sender<CtrlReq>>,
     pub control_port: Option<u16>,
     pub session_key: String,
     /// Receiver for async run-shell results (title, output).
@@ -1177,6 +1189,7 @@ impl AppState {
             key_tables: std::collections::HashMap::new(),
             current_key_table: None,
             control_rx: None,
+            control_tx: None,
             control_port: None,
             session_key: String::new(),
             run_shell_rx: None,
@@ -1506,6 +1519,17 @@ pub enum CtrlReq {
     ListAllPanes(mpsc::Sender<String>),
     ListAllPanesFormat(mpsc::Sender<String>, String),
     KillWindow,
+    /// kill-window with an explicit window target. The server resolves the
+    /// target itself and reports an unresolvable one as an error instead of
+    /// killing whatever window happens to be active (tmux parity: tmux says
+    /// "can't find window: X" and kills nothing). `win` carries an index or,
+    /// when `win_is_id` is set, an @id; `name` carries a window-name target.
+    KillWindowTarget {
+        win: Option<usize>,
+        win_is_id: bool,
+        name: Option<String>,
+        resp: mpsc::Sender<Result<(), String>>,
+    },
     KillSession,
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),
@@ -1574,6 +1598,7 @@ pub enum CtrlReq {
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
     SetOptionOnlyIfUnset(String, String),  // set-option -o
+    SetOptionToggle(String),  // set-option <bool-option> with no value (#535)
     /// Per-window `window-size` override; None unsets the local value.
     SetWindowSize(Option<String>),
     ShowOptions(mpsc::Sender<String>),

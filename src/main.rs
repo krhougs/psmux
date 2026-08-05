@@ -217,6 +217,11 @@ fn run_main() -> io::Result<()> {
 
     // Clean up any stale port files at startup
     cleanup_stale_port_files();
+    // Then drop registry files whose `.port` entry is already gone (issue
+    // #530). The sweep above is the only thing that can reach them, and it
+    // finds entries BY their `.port` file — so a satellite that outlives its
+    // port is invisible to it and accumulates forever.
+    crate::session::prune_orphaned_registry_files();
     // Then reap any LIVE but orphaned server processes (issue #448): duplicates
     // or crashed-client headless servers that cleanup_stale_port_files cannot
     // see because they have no registry file. Bounds the process count so
@@ -534,19 +539,17 @@ fn run_main() -> io::Result<()> {
                             }
                         }
                     }
-                    // Remove port/key/pid files regardless
-                    let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::remove_file(path.with_extension("key"));
-                    let _ = std::fs::remove_file(path.with_extension("pid"));
+                    // Remove the whole registry set regardless. Deleting only
+                    // port/key/pid used to strand the `.sid`, which no sweep can
+                    // reach once its `.port` is gone (#530).
+                    crate::session::remove_session_registry_files(&path);
                 })
             }).collect();
             // Wait for all threads to complete
             for h in handles { let _ = h.join(); }
-            // Clean up stale port/key/pid files
+            // Clean up stale registry sets (whole set, including `.sid` — #530)
             for path in &stale_ports {
-                let _ = std::fs::remove_file(path);
-                let _ = std::fs::remove_file(path.with_extension("key"));
-                let _ = std::fs::remove_file(path.with_extension("pid"));
+                crate::session::remove_session_registry_files(path);
             }
             // Force-kill any wedged server that ignored the graceful kill. The
             // candidates were read from this data dir's (and, with -L, this
@@ -716,10 +719,10 @@ fn run_main() -> io::Result<()> {
                                                     println!("{}", display_name); 
                                                 }
                                             } else if refused {
-                                                // Actively refused → truly dead; remove stale port + key.
-                                                let _ = std::fs::remove_file(e.path());
-                                                let key_path = e.path().with_extension("key");
-                                                let _ = std::fs::remove_file(&key_path);
+                                                // Actively refused → truly dead. Remove the WHOLE
+                                                // set: dropping the `.port` alone would strand its
+                                                // siblings where no sweep can reach them (#530).
+                                                crate::session::remove_session_registry_files(&e.path());
                                             }
                                         }
                                     }
@@ -952,13 +955,15 @@ fn run_main() -> io::Result<()> {
                 // A detached (-d) session does not take over the current terminal,
                 // so it is allowed to be created from inside an existing session,
                 // matching tmux (which only warns for commands that grab the pty).
-                if !detached && env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1") {
-                    if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1")
-                        || env::var("PSMUX_SESSION").ok().filter(|v| !v.is_empty()).is_some()
-                    {
-                        eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
-                        return Ok(());
-                    }
+                // A popup is not a pane, so a session started from one is not
+                // nested — util::inside_psmux_pane() draws the same line tmux
+                // draws with its all_window_panes tty walk (#537).
+                if !detached
+                    && env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1")
+                    && crate::util::inside_psmux_pane()
+                {
+                    eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
+                    return Ok(());
                 }
 
                 let name = session_name.unwrap_or_else(|| {
@@ -1883,9 +1888,8 @@ fn run_main() -> io::Result<()> {
                                                     }
                                                 }
                                             } else if refused {
-                                                let _ = std::fs::remove_file(e.path());
-                                                let key_path = e.path().with_extension("key");
-                                                let _ = std::fs::remove_file(&key_path);
+                                                // Whole set, not just port+key (#530).
+                                                crate::session::remove_session_registry_files(&e.path());
                                             }
                                         }
                                     }
@@ -2003,9 +2007,8 @@ fn run_main() -> io::Result<()> {
                                                     }
                                                 }
                                             } else if refused {
-                                                let _ = std::fs::remove_file(e.path());
-                                                let key_path = e.path().with_extension("key");
-                                                let _ = std::fs::remove_file(&key_path);
+                                                // Whole set, not just port+key (#530).
+                                                crate::session::remove_session_registry_files(&e.path());
                                             }
                                         }
                                     }
@@ -3000,15 +3003,49 @@ fn run_main() -> io::Result<()> {
                         "pane-base-index", "status-left-length", "status-right-length",
                         "history-file-limit",
                     ];
-                    // Collect positional (non-flag) args, skipping -t's value.
+                    // Collect positional (non-flag) args, skipping -t/-p values.
+                    // `@user-options` start with '@', not '-', so they are
+                    // positionals; an explicit empty string ("") is a real
+                    // value and must stay in the list (tmux accepts
+                    // `set -g @foo ""`).
                     let mut positionals: Vec<&str> = Vec::new();
+                    let mut flags = String::new();
                     let mut j = 1;
                     while j < cmd_args.len() {
                         let a = cmd_args[j].as_str();
-                        if a == "-t" { j += 2; continue; }
-                        if a.starts_with('-') { j += 1; continue; }
+                        if a == "-t" || a == "-p" { j += 2; continue; }
+                        if a.starts_with('-') && a.len() > 1 {
+                            flags.push_str(&a[1..]);
+                            j += 1;
+                            continue;
+                        }
                         positionals.push(a);
                         j += 1;
+                    }
+                    let has_unset = flags.contains('u') || flags.contains('U');
+                    let has_append = flags.contains('a');
+                    // Issue #535: a set-option carrying no value used to be
+                    // dropped in silence: nothing set, empty stderr, exit 0.
+                    // That turned a one-character mistake (PowerShell eats a
+                    // bare `@name` as the splatting operator, so `set -g
+                    // @pill $undefined` arrives as `set -g <text>`) into an
+                    // undebuggable no-op. tmux fails these loudly, so we do
+                    // too. `-q` is NOT consulted: both tmux's manual and our
+                    // own -q help text scope it to unknown/ambiguous options,
+                    // and tmux 3.4 still errors on `set -gq @foo`.
+                    if positionals.is_empty() {
+                        eprintln!("psmux: set-option: too few arguments (need at least 1)");
+                        std::process::exit(1);
+                    }
+                    if positionals.len() == 1 && !has_unset {
+                        let name = positionals[0];
+                        // Boolean flags legitimately take no value: they
+                        // toggle (tmux parity, #278). Everything else is an
+                        // error. `-a` appends, so it always needs a value.
+                        if has_append || !crate::server::options::missing_value_toggles(name) {
+                            eprintln!("psmux: set-option: empty value for '{}'", name);
+                            std::process::exit(1);
+                        }
                     }
                     if let (Some(name), Some(val)) = (positionals.first(), positionals.get(1)) {
                         if INT_OPTS.contains(name) && val.parse::<i64>().is_err() {
@@ -3019,7 +3056,21 @@ fn run_main() -> io::Result<()> {
                 }
                 let cmd_str: String = cmd_args.iter().map(|s| {
                     let s = s.as_str();
-                    if s.contains(' ') {
+                    // An explicitly empty argument must be re-quoted, or it
+                    // collapses into the joining whitespace and the server
+                    // re-splits one positional short, so `set -g @foo ""`
+                    // (tmux: clear the option) silently kept the old value.
+                    // parse_command_line already preserves a quoted empty
+                    // token, see #177.
+                    //
+                    // The test is any Unicode whitespace, not just an ASCII
+                    // space: the server re-splits on char::is_whitespace(), so
+                    // a value whose only separators were NBSPs used to arrive
+                    // unquoted, get re-split, and come back collapsed AND
+                    // rewritten to ASCII spaces. Whether a value survived
+                    // depended on whether it happened to contain an ASCII
+                    // space (#536).
+                    if s.is_empty() || s.chars().any(char::is_whitespace) {
                         format!("\"{}\"", s.replace('"', "\\\""))
                     } else {
                         s.to_string()
@@ -4055,15 +4106,14 @@ fn run_main() -> io::Result<()> {
     // Prevent nesting: similar to tmux checking $TMUX.
     // PSMUX_ACTIVE is set on the client process itself.
     // PSMUX_SESSION is set on child panes spawned by the server.
-    // Both indicate we are already inside psmux.
+    // Both indicate we are already inside a psmux PANE; a display-popup child
+    // is not one, and tmux attaches happily from there (#537).
     // Override with PSMUX_ALLOW_NESTING=1 if nesting is intentional.
-    if env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1") {
-        if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1")
-            || env::var("PSMUX_SESSION").ok().filter(|v| !v.is_empty()).is_some()
-        {
-            eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
-            return Ok(());
-        }
+    if env::var("PSMUX_ALLOW_NESTING").ok().as_deref() != Some("1")
+        && crate::util::inside_psmux_pane()
+    {
+        eprintln!("psmux: sessions should be nested with care, unset PSMUX_SESSION to force");
+        return Ok(());
     }
     env::set_var("PSMUX_ACTIVE", "1");
 
