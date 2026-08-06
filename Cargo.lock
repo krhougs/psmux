@@ -1370,6 +1370,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "glob",
+ "parking_lot",
  "portable-pty-psmux",
  "ratatui",
  "regex",
