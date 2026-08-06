@@ -4483,3 +4483,11 @@ mod tests_send_keys_literal_byte;
 #[cfg(test)]
 #[path = "../../tests-rs/test_control_mode_liveness.rs"]
 mod tests_control_mode_liveness;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_capture_pane_wait_bound.rs"]
+mod tests_capture_pane_wait_bound;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_refresh_client_flags.rs"]
+mod tests_refresh_client_flags;
