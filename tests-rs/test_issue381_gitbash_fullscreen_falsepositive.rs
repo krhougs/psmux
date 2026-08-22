@@ -68,6 +68,9 @@ fn make_pane(term: Arc<Mutex<vt100::Parser>>, rows: u16, cols: u16, child_pid: O
         writer,
         child,
         term,
+        keyboard_modes: Arc::new(Mutex::new(
+            crate::keyboard_modes::KeyboardModeTracker::default(),
+        )),
         last_rows: rows,
         last_cols: cols,
         id: 0,

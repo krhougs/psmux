@@ -2460,6 +2460,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let parts: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
                         for (i, key) in parts.iter().enumerate() {
                             let key_upper = key.to_uppercase();
+                            if crate::keyboard_modes::is_semantic_send_keys_token(key) {
+                                send_key_to_active(&mut app, &key.to_ascii_lowercase())?;
+                                continue;
+                            }
                             let _is_special = matches!(key_upper.as_str(), 
                                 "ENTER" | "TAB" | "BTAB" | "BACKTAB" | "ESCAPE" | "ESC" | "SPACE" | "BSPACE" | "BACKSPACE" |
                                 "UP" | "DOWN" | "RIGHT" | "LEFT" | "HOME" | "END" |

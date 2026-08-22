@@ -112,6 +112,9 @@ pub fn create_popup_pane(
     let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
 
     match pair.master.try_clone_reader() {
@@ -124,6 +127,7 @@ pub fn create_popup_pane(
                 bell_pending.clone(),
                 cpr_pending.clone(),
                 color_query_pending.clone(),
+                keyboard_modes.clone(),
                 output_ring.clone(),
                 pane_id,
             );
@@ -154,6 +158,7 @@ pub fn create_popup_pane(
         writer: pty_writer,
         child,
         term,
+        keyboard_modes,
         last_rows: rows,
         last_cols: cols,
         id: pane_id,
@@ -224,6 +229,9 @@ pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
         writer: pty_writer,
         child: Box::new(NullChild),
         term,
+        keyboard_modes: Arc::new(Mutex::new(
+            crate::keyboard_modes::KeyboardModeTracker::default(),
+        )),
         last_rows: rows,
         last_cols: cols,
         id: pane_id,

@@ -86,13 +86,16 @@ pub fn handle_pane_forward_extract(
     let cols = pane.last_cols;
     // Capture full screen state (with colors, attributes, cursor) as VT escape codes
     let screen_b64 = {
+        let mut buffer = pane
+            .keyboard_modes
+            .lock()
+            .map(|tracker| tracker.active().restore_sequences())
+            .unwrap_or_default();
         if let Ok(parser) = pane.term.lock() {
-            let buf = parser.screen().state_formatted();
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(&buf)
-        } else {
-            String::new()
+            buffer.extend_from_slice(&parser.screen().state_formatted());
         }
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&buffer)
     };
     // Start TCP forwarding listener
     let listener = match TcpListener::bind("127.0.0.1:0") {
@@ -274,6 +277,7 @@ pub fn handle_pane_forward_inject(
         proxy_pane.bell_pending.clone(),
         proxy_pane.cpr_pending.clone(),
         proxy_pane.color_query_pending.clone(),
+        proxy_pane.keyboard_modes.clone(),
         proxy_pane.output_ring.clone(),
         pane_id,
     );

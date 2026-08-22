@@ -3527,6 +3527,35 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // Write a named key to a single pane (extracted for sync_input support).
     fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
         use std::io::Write as _;
+        if let Some(event) = crate::keyboard_modes::parse_send_keys_token(k) {
+            let mode = p
+                .keyboard_modes
+                .lock()
+                .map(|tracker| tracker.active().clone())
+                .unwrap_or_default();
+            let enhanced = mode.kitty_flags() != 0 || mode.modify_other_keys != 0;
+            let terminal_function = matches!(
+                event.key,
+                crate::keyboard_modes::SemanticKey::ArrowUp
+                    | crate::keyboard_modes::SemanticKey::ArrowDown
+                    | crate::keyboard_modes::SemanticKey::ArrowLeft
+                    | crate::keyboard_modes::SemanticKey::ArrowRight
+                    | crate::keyboard_modes::SemanticKey::Home
+                    | crate::keyboard_modes::SemanticKey::End
+                    | crate::keyboard_modes::SemanticKey::PageUp
+                    | crate::keyboard_modes::SemanticKey::PageDown
+                    | crate::keyboard_modes::SemanticKey::Insert
+                    | crate::keyboard_modes::SemanticKey::Delete
+                    | crate::keyboard_modes::SemanticKey::Function(_)
+            );
+            if enhanced || terminal_function {
+                if let Some(bytes) = crate::keyboard_modes::encode_key_event(event, &mode) {
+                    write_key_seq(p, &bytes);
+                }
+                let _ = p.writer.flush();
+                return;
+            }
+        }
         match k {
             "enter" => write_key_seq(p, b"\r"),
             "tab" => write_key_seq(p, b"\t"),

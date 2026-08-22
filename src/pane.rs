@@ -359,7 +359,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, keyboard_modes: wp.keyboard_modes, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             if let Some(dir) = start_dir {
                 silent_rehome(&mut pane, dir);
@@ -435,13 +435,28 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
     let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id);
+    spawn_reader_thread(
+        reader,
+        term_reader,
+        dv_writer,
+        cs_writer,
+        bell_writer,
+        cpr_writer,
+        cq_writer,
+        keyboard_modes_writer,
+        output_ring.clone(),
+        app.next_pane_id,
+    );
 
     let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
@@ -450,7 +465,7 @@ pub fn create_window_with_env(pty_system: &dyn portable_pty::PtySystem, app: &mu
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, keyboard_modes, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -548,6 +563,10 @@ pub(crate) fn spawn_warm_pane_from_spec(
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
     let reader = match pair.master.try_clone_reader() {
         Ok(reader) => reader,
         Err(error) => {
@@ -570,9 +589,20 @@ pub(crate) fn spawn_warm_pane_from_spec(
             ));
         }
     };
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+    spawn_reader_thread(
+        reader,
+        term_reader,
+        dv_writer,
+        cs_writer,
+        bell_writer,
+        cpr_writer,
+        cq_writer,
+        keyboard_modes_writer,
+        output_ring.clone(),
+        pane_id,
+    );
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows: size.rows, cols: size.cols, output_ring })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, keyboard_modes, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows: size.rows, cols: size.cols, output_ring })
 }
 
 pub fn spawn_warm_pane(
@@ -623,13 +653,28 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
     let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id);
+    spawn_reader_thread(
+        reader,
+        term_reader,
+        dv_writer,
+        cs_writer,
+        bell_writer,
+        cpr_writer,
+        cq_writer,
+        keyboard_modes_writer,
+        output_ring.clone(),
+        app.next_pane_id,
+    );
 
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = spawn_pane_write_queue(pair.master.take_writer()
@@ -637,7 +682,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, keyboard_modes, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, area: app.client_area, window_size: None, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![raw_pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -759,7 +804,7 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
-            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, keyboard_modes: wp.keyboard_modes, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, color_query_pending: wp.color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             if let Some(dir) = start_dir {
                 silent_rehome(&mut new_pane, dir);
@@ -823,15 +868,30 @@ pub fn split_active_with_env(app: &mut AppState, kind: LayoutKind, command: Opti
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), app.next_pane_id);
+    spawn_reader_thread(
+        reader,
+        term_reader,
+        dv_writer,
+        cs_writer,
+        bell_writer,
+        cpr_writer,
+        cq_writer,
+        keyboard_modes_writer,
+        output_ring.clone(),
+        app.next_pane_id,
+    );
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, keyboard_modes, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, scroll_fg_cache: None, cursor_shape, bell_pending, cpr_pending, color_query_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -2114,8 +2174,7 @@ impl ColorQueryScanner {
     }
 }
 
-// TODO: The 8 Arc parameters below should be grouped into a `ReaderSignals`
-// struct the next time a new signal is added, to keep the call-site manageable.
+// TODO: Group the shared reader signals into a struct if another one is added.
 pub fn spawn_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     term_reader: Arc<Mutex<vt100::Parser>>,
@@ -2124,6 +2183,7 @@ pub fn spawn_reader_thread(
     bell_pending: Arc<std::sync::atomic::AtomicBool>,
     cpr_pending: Arc<std::sync::atomic::AtomicBool>,
     color_query_pending: Arc<std::sync::atomic::AtomicU32>,
+    keyboard_modes: Arc<Mutex<crate::keyboard_modes::KeyboardModeTracker>>,
     output_ring: Arc<Mutex<std::collections::VecDeque<u8>>>,
     pane_id: usize,
 ) {
@@ -2343,6 +2403,9 @@ pub fn spawn_reader_thread(
             // Issue #502 diagnostic: capture the exact pre-parse byte stream
             // when PSMUX_PANE_RAW=1. Off by default, one atomic load when off.
             crate::debug_log::pane_raw(&bytes);
+            if let Ok(mut tracker) = keyboard_modes.lock() {
+                tracker.advance(&bytes);
+            }
 
             if let Ok(mut parser) = term_reader.lock() {
                 parser.process(&bytes);

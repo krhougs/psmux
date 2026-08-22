@@ -1958,9 +1958,13 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
 
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, keyboard_modes_writer, output_ring.clone(), pane_id);
     pane.output_ring = output_ring;
 
     let mut pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
@@ -1970,6 +1974,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.keyboard_modes = keyboard_modes;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
@@ -2032,8 +2037,12 @@ pub fn heal_respawn_pane(
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
+    let keyboard_modes_writer = keyboard_modes.clone();
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, keyboard_modes_writer, output_ring.clone(), pane_id);
 
     let mut pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
@@ -2045,6 +2054,7 @@ pub fn heal_respawn_pane(
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.keyboard_modes = keyboard_modes;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;

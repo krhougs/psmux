@@ -253,8 +253,14 @@ pub fn create_proxy_pane(
     );
     let proxy_child = ProxyChild::new(control_addr, control_key, forward_id, pid);
     let term = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000)));
+    let keyboard_modes = Arc::new(Mutex::new(
+        crate::keyboard_modes::KeyboardModeTracker::default(),
+    ));
     // Replay screen snapshot if provided (captures terminal state from source)
     if let Some(snap) = screen_snapshot {
+        if let Ok(mut tracker) = keyboard_modes.lock() {
+            tracker.advance(&snap);
+        }
         if let Ok(mut p) = term.lock() {
             p.process(&snap);
         }
@@ -265,6 +271,7 @@ pub fn create_proxy_pane(
         writer: crate::pane::spawn_pane_write_queue(Box::new(writer)),
         child: Box::new(proxy_child),
         term,
+        keyboard_modes,
         last_rows: rows,
         last_cols: cols,
         id: pane_id,

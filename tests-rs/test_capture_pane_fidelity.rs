@@ -84,6 +84,9 @@ fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
         writer: Box::new(DummyWriter),
         child: Box::new(DummyChild),
         term,
+        keyboard_modes: Arc::new(Mutex::new(
+            crate::keyboard_modes::KeyboardModeTracker::default(),
+        )),
         last_rows: rows,
         last_cols: cols,
         id,

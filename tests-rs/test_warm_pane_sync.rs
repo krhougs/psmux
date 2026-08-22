@@ -136,6 +136,9 @@ fn resize_to_same_size_is_noop() {
         writer,
         child,
         term: fake_term,
+        keyboard_modes: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::keyboard_modes::KeyboardModeTracker::default(),
+        )),
         data_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cursor_shape: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         bell_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
